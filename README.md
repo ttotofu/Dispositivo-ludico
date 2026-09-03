@@ -5,7 +5,7 @@
 **Equipo:** []  
 **Problematica:**  Uso prolongado de pantallas en preadolescentes
 
-![Foto del equipo]
+![Foto del equipo](imagenes/S01/foto-equipo.jpg)
 
 ## Descripción
 Desde la pandemia el uso de celulares y aparatos electrónicos se han convertido en prácticas normalizadas que permiten a niños y adolescentes acceder y participar tanto de instancias educativas como recreacionales y sociales. Estímulos visuales, el acceso infinito a información y la aparente conexión social, estos dispositivos y aplicaciones provocan la dependencia y adicción especialmente si se utilizan a temprana edad y etapas transitorias, llegando a tener múltiples efectos negativos, siendo algunos la disminución en la capacidad de concentración, baja tolerancia al aburrimiento y frustración, dificultad en la interacción social y reconocimiento de emociones y lenguaje no verbal, entre otros. Por consiguiente, si bien es inevitable el uso de dispositivos en niños y adolescentes, se identifica como oportunidad el diseñar dispositivos acordes y amigables a su edad y etapa de desarrollo cognitivo, afectivo y socioemocional.
@@ -39,8 +39,8 @@ Desde la pandemia el uso de celulares y aparatos electrónicos se han convertido
 
 **Referencias evidencias**
 - Asociación Española de Pediatría. (2025). Nuevas recomendaciones sobre pantallas en infancia adolescencia · Actualidad · En familia. AEPED. https://www.aeped.es/enfamilia/actualidad/nuevas-recomendaciones-sobre-pantallas-en-infancia-adolescencia 
-- Bennett, L. (2025, 21 julio). ¿Cómo afectan las pantallas al aprendizaje y el desarrollo en la infancia? Pontificia Universidad Católica de Chile. https://www.uc.cl/noticias/como-afectan-las-pantallas-al-aprendizaje-y-el-desarrollo-en-la-infancia/
--  Qi J, Yan Y, Yin H. Screen time among school-aged children of aged 6-14: a systematic review. Glob Health Res Policy. 2023 Apr 19;8(1):12. doi: 10.1186/s41256-023-00297-z. PMID: 37076910; PMCID: PMC10113131.
+- Bennett, L. (2025). ¿Cómo afectan las pantallas al aprendizaje y el desarrollo en la infancia? Pontificia Universidad Católica de Chile. https://www.uc.cl/noticias/como-afectan-las-pantallas-al-aprendizaje-y-el-desarrollo-en-la-infancia/
+-  Qi J, Yan Y, Yin H. (2023) Screen time among school-aged children of aged 6-14: a systematic review. Glob Health Res Policy. https://pubmed.ncbi.nlm.nih.gov/37076910/
 -  UNICEF CHILE. (2023). Se adelanta a los 8,9 años el acceso al celular con Internet y crece su uso para tareas escolares y aprender cosas que les gustan. UNICEF. https://www.unicef.org/chile/comunicados-prensa/se-adelanta-los-89-a%C3%B1os-el-acceso-al-celular-con-internet-y-crece-su-uso-para
 
 
