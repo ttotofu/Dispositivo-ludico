@@ -1,4 +1,4 @@
-# Dispositivo-ludico-multijugador
+# Dispositivo-ludico
 
 ## Dispositivos lowtech e interfaces interactivas 
 
