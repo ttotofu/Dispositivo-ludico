@@ -5,7 +5,7 @@
 **Equipo:** []  
 **Problematica:**  Uso prolongado de pantallas en preadolescentes
 
-![Foto del equipo](imagenes/S01/foto_equipo.jpg)
+![Foto del equipo](imagenes/S01.md)
 
 ## Descripción
 Desde la pandemia el uso de celulares y aparatos electrónicos se han convertido en prácticas normalizadas que permiten a niños y adolescentes acceder y participar tanto de instancias educativas como recreacionales y sociales. Estímulos visuales, el acceso infinito a información y la aparente conexión social, estos dispositivos y aplicaciones provocan la dependencia y adicción especialmente si se utilizan a temprana edad y etapas transitorias, llegando a tener múltiples efectos negativos, siendo algunos la disminución en la capacidad de concentración, baja tolerancia al aburrimiento y frustración, dificultad en la interacción social y reconocimiento de emociones y lenguaje no verbal, entre otros. Por consiguiente, si bien es inevitable el uso de dispositivos en niños y adolescentes, se identifica como oportunidad el diseñar dispositivos acordes y amigables a su edad y etapa de desarrollo cognitivo, afectivo y socioemocional.
