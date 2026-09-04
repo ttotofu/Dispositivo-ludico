@@ -43,6 +43,8 @@ Desde la pandemia el uso de celulares y aparatos electrónicos se han convertido
 -  Qi J, Yan Y, Yin H. (2023) Screen time among school-aged children of aged 6-14: a systematic review. Glob Health Res Policy. https://pubmed.ncbi.nlm.nih.gov/37076910/
 -  UNICEF CHILE. (2023). Se adelanta a los 8,9 años el acceso al celular con Internet y crece su uso para tareas escolares y aprender cosas que les gustan. UNICEF. https://www.unicef.org/chile/comunicados-prensa/se-adelanta-los-89-a%C3%B1os-el-acceso-al-celular-con-internet-y-crece-su-uso-para
 
+**Referentes**
+![Referencias](imagenes/Referentes.jpg)
 
 ## Índice de la bitácora
 
