@@ -3,6 +3,7 @@
 ## Dispositivos lowtech e interfaces interactivas 
 
 **Equipo:** 404 
+
 **Problematica:**  Uso prolongado de pantallas en preadolescentes
 
 ![Foto del equipo](imagenes/S01.md)
