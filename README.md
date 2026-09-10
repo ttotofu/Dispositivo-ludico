@@ -47,6 +47,15 @@ Desde la pandemia el uso de celulares y aparatos electrónicos se han convertido
 **Referentes**
 ![Referencias](imagenes/Referentes.jpg)
 
+**Variables**
+- Control parental
+- Tiempo de uso de pantallas
+- Colores captados
+- Dispositivos vinculados
+
+**Hipótesis dispositivo**
+Dispositivo con cámara integrada que combine los fundamentos de los juegos "Veo veo" y "Búsqueda del tesoro" pero enfocado a la recolección de colores. Se podrá usar entre varios usuarios (rango a definir), quienes al vincular los dispositivos podrán asignar al otro jugador el color a buscar. El dispositivo podrá identificar el color captado y se establecerá un sistema de puntos, bajo el cual quien recolecte la mayor cantidad de imágenes del color obtendrá una recompensa (a definir, pero podría estar relacionado a la personalización de algún elemento del dispositivo, un personaje u otro).
+
 ## Índice de la bitácora
 
 - [S01 - Entrega 01](bitacora/S01.md)
