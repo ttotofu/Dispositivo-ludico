@@ -3,6 +3,7 @@
 **Resultados:** 
 
 **Código:**  
+
 /*
   Prototipo: camara OV7670 -> pantalla circular GC9A01 (240x240) + sensor de color TCS34725
   Placa: ESP32 Dev Module (Arduino IDE)
