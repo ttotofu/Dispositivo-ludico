@@ -1,0 +1,58 @@
+**Descripcion:**
+
+
+**Resultados:**
+
+
+
+**Código:**
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+
+#define PIN_SDA 21
+#define PIN_SCL 22
+#define PIN_LED 4   // LED blanco del sensor (si no lo conectaste, no pasa nada)
+
+// Integración = cuánto tiempo "mira" el sensor. Ganancia = amplificación de la señal.
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+
+const unsigned long INTERVALO = 500;  // una lectura cada 500 ms
+unsigned long ultimaLectura = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH);  // LED del sensor encendido
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  if (tcs.begin()) {
+    Serial.println("Sensor TCS34725 detectado");
+  } else {
+    Serial.println("No se encontro el sensor. Revisa cables y alimentacion.");
+    while (1) delay(1000);
+  }
+}
+
+void loop() {
+  if (millis() - ultimaLectura >= INTERVALO) {
+    ultimaLectura = millis();
+
+    uint16_t r, g, b, c;  // c = "clear": luz total sin filtro de color
+    tcs.getRawData(&r, &g, &b, &c);
+
+    // Convertir a escala 0-255 usando la luz total como referencia
+    int rN = 0, gN = 0, bN = 0;
+    if (c > 0) {
+      rN = constrain((float)r / c * 255.0, 0, 255);
+      gN = constrain((float)g / c * 255.0, 0, 255);
+      bN = constrain((float)b / c * 255.0, 0, 255);
+    }
+
+    Serial.printf("RAW -> R:%u  G:%u  B:%u  C:%u\n", r, g, b, c);
+    Serial.printf("RGB -> R:%d  G:%d  B:%d\n", rN, gN, bN);
+    Serial.printf("Temp color: %uK | Lux: %u\n\n",
+                  tcs.calculateColorTemperature_dn40(r, g, b, c),
+                  tcs.calculateLux(r, g, b));
+  }
+}
