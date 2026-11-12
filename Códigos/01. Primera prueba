@@ -1,0 +1,286 @@
+**Descripción:**
+
+**Resultados:** 
+
+**Código:**  
+/*
+  Prototipo: camara OV7670 -> pantalla circular GC9A01 (240x240) + sensor de color TCS34725
+  Placa: ESP32 Dev Module (Arduino IDE)
+
+  Librerias necesarias (Gestor de bibliotecas):
+    - GFX Library for Arduino (de moononournation)
+    - Adafruit TCS34725 (y Adafruit BusIO si la pide)
+  La libreria de la camara (esp_camera.h) ya viene incluida con el paquete de placas ESP32.
+
+  Conexiones:
+    Pantalla : SCL=18  SDA=23  CS=5  DC=19  RST=15  (VCC=3V3, GND=GND)
+    Sensor   : SDA=21  SCL=22  (VIN=3V3, GND=GND)
+    Camara   : SDA=16  SCL=17  VS=14  HS=13  PLK=27  XLK=0
+               D0=4 D1=2 D2=34 D3=35 D4=32 D5=33 D6=25 D7=26
+               RET=3V3  PWDN=GND  (con pull-ups de 4.7k en SDA y SCL)
+
+  Serial (115200): enviar la letra 'b' con el sensor frente a un papel blanco
+  para calibrar el balance de blancos.
+*/
+
+#include <Wire.h>
+#include "esp_camera.h"
+#include <Arduino_GFX_Library.h>
+#include "Adafruit_TCS34725.h"
+
+// ---------------- Pines ----------------
+#define PIN_TFT_DC    19
+#define PIN_TFT_CS    5
+#define PIN_TFT_SCK   18
+#define PIN_TFT_MOSI  23
+#define PIN_TFT_RST   15
+
+#define PIN_SENSOR_SDA 21
+#define PIN_SENSOR_SCL 22
+
+#define PIN_CAM_SDA   16
+#define PIN_CAM_SCL   17
+#define PIN_CAM_VSYNC 14
+#define PIN_CAM_HREF  13
+#define PIN_CAM_PCLK  27
+#define PIN_CAM_XCLK  0
+#define PIN_CAM_D0    4
+#define PIN_CAM_D1    2
+#define PIN_CAM_D2    34
+#define PIN_CAM_D3    35
+#define PIN_CAM_D4    32
+#define PIN_CAM_D5    33
+#define PIN_CAM_D6    25
+#define PIN_CAM_D7    26
+
+// Si la imagen sale al reves o en espejo, cambia estos valores (0 o 1)
+#define VOLTEAR_VERTICAL    0
+#define ESPEJAR_HORIZONTAL  0
+
+// ---------------- Pantalla ----------------
+Arduino_DataBus *bus = new Arduino_ESP32SPI(PIN_TFT_DC, PIN_TFT_CS, PIN_TFT_SCK, PIN_TFT_MOSI, GFX_NOT_DEFINED);
+Arduino_GFX *gfx = new Arduino_GC9A01(bus, PIN_TFT_RST, 0 /* rotacion */, true /* IPS */);
+
+// La camara entrega 160x120. Se escala 1.5x a 240x180 y se centra en la pantalla.
+const int DST_W = 240;
+const int DST_H = 180;
+const int DST_Y = 30;
+const int CHUNK = 9;               // filas que se envian juntas a la pantalla
+uint16_t bloque[DST_W * CHUNK];
+
+// ---------------- Sensor de color ----------------
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+bool sensorOK = false;
+
+// Ajustes de deteccion (cambialos segun tu iluminacion mirando los valores del Serial)
+const uint16_t UMBRAL_NEGRO  = 150;    // C por debajo de esto = negro
+const uint16_t UMBRAL_BLANCO = 4000;   // C por encima de esto (y sin color) = blanco
+const float    SAT_MINIMA    = 0.18;   // saturacion minima para considerar que hay color
+
+float kR = 1.0, kG = 1.0, kB = 1.0;    // factores de balance de blancos
+uint16_t rRaw = 0, gRaw = 0, bRaw = 0, cRaw = 0;
+String colorActual = "---";
+uint16_t colorMuestra = 0;
+
+const unsigned long INTERVALO_SENSOR = 300;  // ms entre lecturas
+unsigned long ultimoSensor = 0;
+
+// ---------------- Camara ----------------
+bool iniciarCamara() {
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0 = PIN_CAM_D0;
+  config.pin_d1 = PIN_CAM_D1;
+  config.pin_d2 = PIN_CAM_D2;
+  config.pin_d3 = PIN_CAM_D3;
+  config.pin_d4 = PIN_CAM_D4;
+  config.pin_d5 = PIN_CAM_D5;
+  config.pin_d6 = PIN_CAM_D6;
+  config.pin_d7 = PIN_CAM_D7;
+  config.pin_xclk  = PIN_CAM_XCLK;
+  config.pin_pclk  = PIN_CAM_PCLK;
+  config.pin_vsync = PIN_CAM_VSYNC;
+  config.pin_href  = PIN_CAM_HREF;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  config.pin_sccb_sda = PIN_CAM_SDA;
+  config.pin_sccb_scl = PIN_CAM_SCL;
+  config.sccb_i2c_port = 1;            // el sensor TCS34725 usa el puerto 0 (Wire)
+#else
+  config.pin_sscb_sda = PIN_CAM_SDA;
+  config.pin_sscb_scl = PIN_CAM_SCL;
+#endif
+  config.pin_pwdn  = -1;               // PWDN va fijo a GND
+  config.pin_reset = -1;               // RET va fijo a 3V3
+  config.xclk_freq_hz = 10000000;      // 10 MHz: mas estable con cables sueltos
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size   = FRAMESIZE_QQVGA;   // 160x120
+  config.jpeg_quality = 12;
+  config.fb_count     = 1;
+  config.fb_location  = CAMERA_FB_IN_DRAM;
+  config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Error al iniciar la camara: 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip(s, VOLTEAR_VERTICAL);
+    s->set_hmirror(s, ESPEJAR_HORIZONTAL);
+  }
+  return true;
+}
+
+// Escala el cuadro de la camara y lo dibuja en la pantalla
+void mostrarFrame(camera_fb_t *fb) {
+  uint16_t *src = (uint16_t *)fb->buf;
+  for (int y0 = 0; y0 < DST_H; y0 += CHUNK) {
+    for (int dy = 0; dy < CHUNK; dy++) {
+      int sy = (y0 + dy) * fb->height / DST_H;
+      uint16_t *fila = src + sy * fb->width;
+      uint16_t *dst = bloque + dy * DST_W;
+      for (int x = 0; x < DST_W; x++) {
+        dst[x] = fila[x * fb->width / DST_W];
+      }
+    }
+    // Los datos de la camara vienen en orden "big-endian"
+    // (si los colores se ven mal, cambia por draw16bitRGBBitmap)
+    gfx->draw16bitBeRGBBitmap(0, DST_Y + y0, bloque, DST_W, CHUNK);
+  }
+}
+
+// Mira central: marca la zona que mide el sensor
+void dibujarMira() {
+  gfx->drawCircle(120, 120, 16, WHITE);
+  gfx->drawFastHLine(100, 120, 12, WHITE);
+  gfx->drawFastHLine(128, 120, 12, WHITE);
+  gfx->drawFastVLine(120, 100, 12, WHITE);
+  gfx->drawFastVLine(120, 128, 12, WHITE);
+}
+
+// ---------------- Sensor: identificar color ----------------
+String identificarColor(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
+  if (c < UMBRAL_NEGRO) return "Negro";
+
+  float rf = r * kR, gf = g * kG, bf = b * kB;
+  float mx = max(rf, max(gf, bf));
+  float mn = min(rf, min(gf, bf));
+  if (mx <= 0) return "Negro";
+
+  float sat = (mx - mn) / mx;
+  if (sat < SAT_MINIMA) {
+    return (c > UMBRAL_BLANCO) ? "Blanco" : "Gris";
+  }
+
+  // Tono (hue) en grados, 0-360
+  float d = mx - mn;
+  float h;
+  if (mx == rf)      h = 60.0 * fmod((gf - bf) / d, 6.0);
+  else if (mx == gf) h = 60.0 * ((bf - rf) / d + 2.0);
+  else               h = 60.0 * ((rf - gf) / d + 4.0);
+  if (h < 0) h += 360.0;
+
+  if (h < 15 || h >= 345) return "Rojo";
+  if (h < 40)  return "Naranjo";
+  if (h < 70)  return "Amarillo";
+  if (h < 160) return "Verde";
+  if (h < 200) return "Celeste";
+  if (h < 260) return "Azul";
+  if (h < 300) return "Morado";
+  return "Rosado";
+}
+
+uint16_t colorParaMuestra(uint16_t r, uint16_t g, uint16_t b, uint16_t c) {
+  float rf = r * kR, gf = g * kG, bf = b * kB;
+  float mx = max(rf, max(gf, bf));
+  if (mx <= 0) return 0;
+  float brillo = constrain((float)c / UMBRAL_BLANCO, 0.25, 1.0);
+  return gfx->color565((uint8_t)(rf / mx * 255 * brillo),
+                       (uint8_t)(gf / mx * 255 * brillo),
+                       (uint8_t)(bf / mx * 255 * brillo));
+}
+
+void leerSensor() {
+  tcs.getRawData(&rRaw, &gRaw, &bRaw, &cRaw);
+  colorActual = identificarColor(rRaw, gRaw, bRaw, cRaw);
+  colorMuestra = colorParaMuestra(rRaw, gRaw, bRaw, cRaw);
+  Serial.printf("R:%u G:%u B:%u C:%u -> %s\n", rRaw, gRaw, bRaw, cRaw, colorActual.c_str());
+}
+
+void calibrarBlanco() {
+  if (rRaw == 0 || gRaw == 0 || bRaw == 0) {
+    Serial.println("Calibracion cancelada: lectura invalida.");
+    return;
+  }
+  float mx = max(rRaw, max(gRaw, bRaw));
+  kR = mx / rRaw;
+  kG = mx / gRaw;
+  kB = mx / bRaw;
+  Serial.printf("Balance de blancos: kR=%.2f kG=%.2f kB=%.2f\n", kR, kG, kB);
+}
+
+// Muestra el color detectado: circulo arriba y nombre abajo (zonas libres de imagen)
+void dibujarInfoColor() {
+  gfx->fillRect(60, 0, 120, 28, BLACK);
+  gfx->fillCircle(120, 14, 11, colorMuestra);
+  gfx->drawCircle(120, 14, 12, WHITE);
+
+  gfx->fillRect(50, 212, 140, 26, BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(WHITE);
+  int ancho = colorActual.length() * 12;
+  gfx->setCursor(120 - ancho / 2, 216);
+  gfx->print(colorActual);
+}
+
+void mensajePantalla(const char *texto) {
+  gfx->fillScreen(BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(WHITE);
+  gfx->setCursor(30, 110);
+  gfx->print(texto);
+}
+
+// ---------------- Programa principal ----------------
+void setup() {
+  Serial.begin(115200);
+
+  gfx->begin(20000000);               // 20 MHz: estable en protoboard
+  gfx->fillScreen(BLACK);
+
+  Wire.begin(PIN_SENSOR_SDA, PIN_SENSOR_SCL);
+  sensorOK = tcs.begin();
+  Serial.println(sensorOK ? "Sensor TCS34725 detectado" : "No se encontro el sensor TCS34725");
+
+  if (!iniciarCamara()) {
+    mensajePantalla("Error camara");
+    while (true) delay(1000);
+  }
+  Serial.println("Camara lista");
+}
+
+void loop() {
+  // Comando por Serial: 'b' = calibrar blanco
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'b' || cmd == 'B') calibrarBlanco();
+  }
+
+  // Imagen de la camara
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb) {
+    mostrarFrame(fb);
+    esp_camera_fb_return(fb);
+    dibujarMira();
+  }
+
+  // Lectura del sensor cada cierto tiempo (sin detener la imagen)
+  if (sensorOK && millis() - ultimoSensor >= INTERVALO_SENSOR) {
+    ultimoSensor = millis();
+    leerSensor();
+    dibujarInfoColor();
+  }
+}
