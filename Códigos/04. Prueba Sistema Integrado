@@ -13,14 +13,18 @@
   Captura basada en bitluni/ESP32CameraI2S.
   Sin WiFi, sin servidor web y sin almacenamiento.
 
+  + Sensor de color TCS34725 (I2C por hardware, pines propios):
+    SDA = GPIO 4, SCL = GPIO 15, VIN = 3V3, GND = GND.
+    OJO: GPIO 21 y 22 ya los usa la camara (D6 y D5), por eso el sensor no puede ir ahi.
+  La pantalla muestra el video en el centro; arriba una muestra del color detectado
+  y abajo su nombre.
+
   IMPORTANTE:
   - Este código está dirigido al ESP32 clásico.
   - Requiere la librería GFX Library for Arduino.
 */
 
 #include <Arduino.h>
-#include <Wire.h>
-#include "Adafruit_TCS34725.h"
 #include <Arduino_GFX_Library.h>
 #include <driver/gpio.h>
 #include <driver/ledc.h>
@@ -33,6 +37,8 @@
 #include <soc/i2s_reg.h>
 #include <soc/i2s_struct.h>
 #include "soc/gpio_struct.h"
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
 
 // --------------------------------------------------
 // PINES DE LA PANTALLA GC9A01
@@ -70,25 +76,6 @@ Arduino_GFX *gfx =
 #define CAM_D5    22
 #define CAM_D6    21
 #define CAM_D7    13
-
-// --------------------------------------------------
-// SENSOR DE COLOR TCS34725
-// Comparte el bus I2C con la OV7670.
-// La cámara usa SCCB durante el arranque; después el
-// bus queda disponible para las lecturas del TCS34725.
-// --------------------------------------------------
-#define SENSOR_SDA CAM_SIOD
-#define SENSOR_SCL CAM_SIOC
-
-Adafruit_TCS34725 tcs(
-  TCS34725_INTEGRATIONTIME_50MS,
-  TCS34725_GAIN_4X
-);
-
-bool sensorColorOK = false;
-unsigned long ultimaLecturaColor = 0;
-const unsigned long INTERVALO_COLOR = 5000;
-char colorDetectado[20] = "INICIANDO";
 
 // --------------------------------------------------
 // RESOLUCIÓN DE CAPTURA
@@ -752,6 +739,335 @@ Serial.printf("Bloque contiguo mayor: %u bytes\n",
 }
 
 // --------------------------------------------------
+// SENSOR DE COLOR TCS34725
+// --------------------------------------------------
+// Pines I2C del sensor (distintos de los de la camara).
+// Alternativa: compartir el bus SCCB de la camara con SENSOR_SDA 26 y SENSOR_SCL 27
+// (el sensor tendria que ir soldado/conectado a esas mismas lineas).
+
+#define SENSOR_SDA 4
+#define SENSOR_SCL 15
+
+Adafruit_TCS34725 tcs =
+  Adafruit_TCS34725(
+    TCS34725_INTEGRATIONTIME_50MS,
+    TCS34725_GAIN_4X
+  );
+
+bool sensorOK = false;
+
+unsigned long ultimaLectura = 0;
+
+// Cada cuanto se lee el color (el codigo original del sensor usaba 5000 ms)
+const unsigned long INTERVALO_COLOR = 1000;
+
+#define COLOR_NEGRO  0x0000
+#define COLOR_BLANCO 0xFFFF
+
+// =====================================================
+// FUNCIÓN: DETECTAR COLOR
+// =====================================================
+
+const char* detectarColor(
+  int rojo,
+  int verde,
+  int azul
+) {
+
+  // ---------------------------------------------------
+  // BUSCAR EL VALOR MÁXIMO Y MÍNIMO
+  // ---------------------------------------------------
+
+  int maximo = max(rojo, max(verde, azul));
+  int minimo = min(rojo, min(verde, azul));
+
+  int diferencia = maximo - minimo;
+
+
+  // ---------------------------------------------------
+  // BRILLO MUY BAJO
+  // ---------------------------------------------------
+
+  if (maximo < 25) {
+    return "NEGRO";
+  }
+
+
+  // ---------------------------------------------------
+  // GRIS
+  // ---------------------------------------------------
+
+  // Si los tres canales son parecidos
+  if (diferencia < 25) {
+
+    if (maximo < 80) {
+      return "GRIS";
+    }
+
+    return "BLANCO";
+  }
+
+
+  // ---------------------------------------------------
+  // BLANCO
+  // ---------------------------------------------------
+
+  if (minimo > 170 &&
+      diferencia < 70) {
+
+    return "BLANCO";
+  }
+
+
+  // ---------------------------------------------------
+  // CALCULAR TONO HUE
+  // ---------------------------------------------------
+
+  float h = 0;
+
+  if (diferencia == 0) {
+
+    h = 0;
+
+  } else if (maximo == rojo) {
+
+    h = 60.0 * (
+      (float)(verde - azul) / diferencia
+    );
+
+    if (h < 0) {
+      h += 360;
+    }
+
+  } else if (maximo == verde) {
+
+    h = 60.0 * (
+      (float)(azul - rojo) / diferencia
+    ) + 120;
+
+  } else {
+
+    h = 60.0 * (
+      (float)(rojo - verde) / diferencia
+    ) + 240;
+  }
+
+
+  // ---------------------------------------------------
+  // SATURACIÓN
+  // ---------------------------------------------------
+
+  float saturacion =
+    (float)diferencia / maximo;
+
+
+  // ---------------------------------------------------
+  // POCO COLOR
+  // ---------------------------------------------------
+
+  if (saturacion < 0.18) {
+
+    if (maximo < 100) {
+      return "GRIS";
+    }
+
+    return "BLANCO";
+  }
+
+
+  // ===================================================
+  // CLASIFICACIÓN
+  // ===================================================
+
+  // ---------------------------------------------------
+  // ROJO
+  // 0° aproximadamente
+  // ---------------------------------------------------
+
+  if (h >= 345 || h < 10) {
+    return "ROJO";
+  }
+
+
+  // ---------------------------------------------------
+  // ROSADO
+  // ---------------------------------------------------
+
+  if (h >= 330 && h < 345) {
+
+    if (rojo > 120) {
+      return "ROSADO";
+    }
+
+    return "ROJO";
+  }
+
+
+  // ---------------------------------------------------
+  // NARANJA
+  // ---------------------------------------------------
+
+  if (h >= 10 && h < 45) {
+    return "NARANJA";
+  }
+
+
+  // ---------------------------------------------------
+  // AMARILLO
+  // ---------------------------------------------------
+
+  if (h >= 45 && h < 75) {
+    return "AMARILLO";
+  }
+
+
+  // ---------------------------------------------------
+  // VERDE
+  // ---------------------------------------------------
+
+  if (h >= 75 && h < 165) {
+    return "VERDE";
+  }
+
+
+  // ---------------------------------------------------
+  // TURQUESA
+  // ---------------------------------------------------
+
+  if (h >= 165 && h < 195) {
+    return "TURQUESA";
+  }
+
+
+  // ---------------------------------------------------
+  // AZUL
+  // ---------------------------------------------------
+
+  if (h >= 195 && h < 255) {
+    return "AZUL";
+  }
+
+
+  // ---------------------------------------------------
+  // MORADO
+  // ---------------------------------------------------
+
+  if (h >= 255 && h < 300) {
+    return "MORADO";
+  }
+
+
+  // ---------------------------------------------------
+  // ROSADO / MAGENTA
+  // ---------------------------------------------------
+
+  if (h >= 300 && h < 345) {
+    return "ROSADO";
+  }
+
+
+  // ---------------------------------------------------
+  // SEGURIDAD
+  // ---------------------------------------------------
+
+  return "COLOR";
+}
+
+
+// --------------------------------------------------
+// MOSTRAR RESULTADO EN LAS BANDAS LIBRES DE LA PANTALLA
+// --------------------------------------------------
+// El video ocupa y = 60 a 179. Arriba (y 0-59) va la muestra de color
+// y abajo (y 180-239) va el nombre del color.
+
+void mostrarResultadoColor(uint16_t colorMuestra, const char *texto)
+{
+  gfx->fillRect(0, 0, 240, 60, COLOR_NEGRO);
+  gfx->fillCircle(120, 30, 22, colorMuestra);
+  gfx->drawCircle(120, 30, 24, COLOR_BLANCO);
+
+  gfx->fillRect(0, 180, 240, 60, COLOR_NEGRO);
+  gfx->setTextSize(3);
+  gfx->setTextColor(COLOR_BLANCO);
+
+  int ancho = strlen(texto) * 18;
+  int x = (240 - ancho) / 2;
+
+  if (x < 5)
+    x = 5;
+
+  gfx->setCursor(x, 186);
+  gfx->print(texto);
+}
+
+// Mira en el centro de la imagen: marca la zona que mide el sensor
+void dibujarMira()
+{
+  gfx->drawCircle(120, 120, 14, COLOR_BLANCO);
+  gfx->drawFastHLine(100, 120, 10, COLOR_BLANCO);
+  gfx->drawFastHLine(130, 120, 10, COLOR_BLANCO);
+  gfx->drawFastVLine(120, 100, 10, COLOR_BLANCO);
+  gfx->drawFastVLine(120, 130, 10, COLOR_BLANCO);
+}
+
+// --------------------------------------------------
+// LEER SENSOR, DETECTAR Y MOSTRAR COLOR
+// --------------------------------------------------
+
+void actualizarColor()
+{
+  uint16_t r;
+  uint16_t g;
+  uint16_t b;
+  uint16_t c;
+
+  tcs.getRawData(&r, &g, &b, &c);
+
+  Serial.println();
+  Serial.println("------------------------------");
+  Serial.printf("R: %u  G: %u  B: %u  C: %u\n", r, g, b, c);
+
+  if (c == 0)
+  {
+    Serial.println("SIN LUZ");
+    mostrarResultadoColor(COLOR_NEGRO, "SIN LUZ");
+    return;
+  }
+
+  // Normalizar RGB (0-255) usando la luz total como referencia
+  int rojo  = constrain((r * 255L) / c, 0, 255);
+  int verde = constrain((g * 255L) / c, 0, 255);
+  int azul  = constrain((b * 255L) / c, 0, 255);
+
+  const char *nombre = detectarColor(rojo, verde, azul);
+
+  Serial.printf("RGB normalizado: %d, %d, %d\n", rojo, verde, azul);
+  Serial.print("COLOR DETECTADO: ");
+  Serial.println(nombre);
+
+  mostrarResultadoColor(gfx->color565(rojo, verde, azul), nombre);
+}
+
+// Se inicia DESPUES de la camara: la camara configura sus pines por software
+// y el sensor usa el I2C por hardware en otros pines.
+void sensorColorBegin()
+{
+  Wire.begin(SENSOR_SDA, SENSOR_SCL);
+
+  if (tcs.begin())
+  {
+    sensorOK = true;
+    Serial.println("TCS34725 OK.");
+  }
+  else
+  {
+    sensorOK = false;
+    Serial.println("ERROR: TCS34725 NO detectado. El video seguira funcionando.");
+    mostrarResultadoColor(COLOR_NEGRO, "SIN SENSOR");
+  }
+}
+
+// --------------------------------------------------
 // SETUP
 // --------------------------------------------------
 
@@ -773,84 +1089,6 @@ void testCameraSCCB()
   {
     Serial.println("ERROR: OV7670 no responde por SCCB");
   }
-}
-
-// --------------------------------------------------
-// CLASIFICACIÓN DEL COLOR (criterios del código original)
-// --------------------------------------------------
-
-const char *nombreColor(uint16_t rojo, uint16_t verde, uint16_t azul)
-{
-  if (rojo < 30 && verde < 30 && azul < 30)
-    return "NEGRO";
-
-  if (rojo > 200 && verde > 200 && azul > 200)
-    return "BLANCO";
-
-  if (rojo > 150 && verde > 130 && azul < 100)
-    return "AMARILLO";
-
-  if (rojo > 170 && verde > 70 && verde < 160 && azul < 80)
-    return "NARANJA";
-
-  if (rojo > verde * 1.4f && rojo > azul * 1.4f)
-    return "ROJO";
-
-  if (verde > rojo * 1.3f && verde > azul * 1.2f)
-    return "VERDE";
-
-  if (azul > rojo * 1.3f && azul > verde * 1.15f)
-    return "AZUL";
-
-  if (verde > rojo * 1.15f && azul > rojo * 1.15f)
-    return "CIAN";
-
-  if (rojo > verde * 1.15f && azul > verde * 1.15f)
-    return "MORADO";
-
-  return "COLOR";
-}
-
-// --------------------------------------------------
-// LECTURA Y PRESENTACIÓN DEL TCS34725
-// --------------------------------------------------
-
-void actualizarColor()
-{
-  uint16_t r = 0;
-  uint16_t g = 0;
-  uint16_t b = 0;
-  uint16_t c = 0;
-
-  tcs.getRawData(&r, &g, &b, &c);
-
-  Serial.println();
-  Serial.println("------------------------------");
-  Serial.print("R: "); Serial.println(r);
-  Serial.print("G: "); Serial.println(g);
-  Serial.print("B: "); Serial.println(b);
-  Serial.print("C: "); Serial.println(c);
-
-  if (c == 0)
-  {
-    strcpy(colorDetectado, "SIN LUZ");
-    Serial.println("Sin luz detectada.");
-  }
-  else
-  {
-    strncpy(colorDetectado, nombreColor(r, g, b), sizeof(colorDetectado) - 1);
-    colorDetectado[sizeof(colorDetectado) - 1] = '\0';
-    Serial.print("Color detectado: ");
-    Serial.println(colorDetectado);
-  }
-
-  // Zona inferior de la pantalla: no tapa el video de la cámara.
-  gfx->fillRect(0, 190, 240, 50, 0x0000);
-  gfx->setTextColor(0xFFFF);
-  gfx->setTextSize(1);
-  gfx->setCursor(8, 198);
-  gfx->print("COLOR: ");
-  gfx->print(colorDetectado);
 }
 
 void setup()
@@ -889,103 +1127,38 @@ void setup()
 
   gfx->fillScreen(0x0000);
 
-  // El bus 26/27 ya fue usado por SCCB al configurar la cámara.
-  // Ahora Wire lo utiliza para comunicarse con el TCS34725.
-  Wire.begin(SENSOR_SDA, SENSOR_SCL);
-  Wire.setClock(100000);
-  Serial.println("Buscando dispositivos I2C...");
-
-for (uint8_t address = 1; address < 127; address++)
-{
-  Wire.beginTransmission(address);
-  uint8_t error = Wire.endTransmission();
-
-  if (error == 0)
-  {
-    Serial.print("Dispositivo encontrado en 0x");
-    Serial.println(address, HEX);
-  }
-}
-
-Serial.println("Fin de busqueda I2C.");
-
-  if (tcs.begin())
-  {
-    sensorColorOK = true;
-    Serial.println("TCS34725 detectado correctamente.");
-    actualizarColor();
-    ultimaLecturaColor = millis();
-  }
-  else
-  {
-    sensorColorOK = false;
-    strcpy(colorDetectado, "NO DETECTADO");
-    Serial.println("ERROR: TCS34725 no detectado. La cámara seguirá funcionando.");
-    gfx->setTextColor(0xFFFF);
-    gfx->setTextSize(1);
-    gfx->setCursor(12, 205);
-    gfx->print("SENSOR NO DETECTADO");
-  }
+  sensorColorBegin();
 
   Serial.println("Sistema listo.");
 }
 
 // --------------------------------------------------
-// ESPEJO HORIZONTAL DEL FOTOGRAMA
-// Intercambia los píxeles de cada fila, sin modificar
-// la captura original de la OV7670.
-// --------------------------------------------------
-void mirrorFrameHorizontal()
-{
-  if (cameraFrame == nullptr)
-    return;
-
-  uint16_t *pixels = (uint16_t *)cameraFrame;
-
-  for (int y = 0; y < CAM_HEIGHT; y++)
-  {
-    uint16_t *row = pixels + (y * CAM_WIDTH);
-
-    for (int x = 0; x < CAM_WIDTH / 2; x++)
-    {
-      uint16_t temp = row[x];
-      row[x] = row[CAM_WIDTH - 1 - x];
-      row[CAM_WIDTH - 1 - x] = temp;
-    }
-  }
-}
-
-// --------------------------------------------------
-// LOOP: VIDEO EN DIRECTO
+// LOOP: VIDEO EN DIRECTO + COLOR
 // --------------------------------------------------
 
 void loop()
 {
-  // Captura y muestra el video continuamente.
-  if (cameraCaptureFrame())
+  // Lectura periodica del color
+  if (sensorOK && millis() - ultimaLectura >= INTERVALO_COLOR)
   {
-    // Invertir horizontalmente para obtener efecto espejo.
-    mirrorFrameHorizontal();
-
-    gfx->draw16bitRGBBitmap(
-      40,
-      60,
-      (uint16_t *)cameraFrame,
-      CAM_WIDTH,
-      CAM_HEIGHT
-    );
+    ultimaLectura = millis();
+    actualizarColor();
   }
-  else
+
+  if (!cameraCaptureFrame())
   {
     Serial.println("No se pudo capturar fotograma.");
     delay(20);
+    return;
   }
 
-  // Actualizar el sensor sin detener permanentemente la cámara.
-  if (sensorColorOK &&
-      millis() - ultimaLecturaColor >= INTERVALO_COLOR)
-  {
-    ultimaLecturaColor = millis();
-    actualizarColor();
-  }
+  gfx->draw16bitRGBBitmap(
+    40,
+    60,
+    (uint16_t *)cameraFrame,
+    CAM_WIDTH,
+    CAM_HEIGHT
+  );
+
+  dibujarMira();
 }
