@@ -1,0 +1,14 @@
+**Descripción:**
+
+**A. Cámara sin FIFO:**
+- https://github.com/bitluni/ESP32CameraI2S/tree/master/ESP32_I2S_Camera
+- https://www.youtube.com/watch?v=S2yTQHM82jc
+
+**B. Escáner I2C:**
+- https://learn.adafruit.com/scanning-i2c-addresses/arduino
+
+**C. Otros proyectos:**
+- https://www.youtube.com/watch?v=cQOZinliPzo
+- https://www.instructables.com/DIY-ESP32-CAM-Based-Color-Reader-for-Color-Blind-W/
+- https://projecthub.arduino.cc/mircemk/esp32-c3-color-detector-with-tcs34725-real-time-rgb-detection-web-interface-6e2f53
+- https://www.instructables.com/Toy-Camera-Using-ESP32-OV2640-Camera-and-35-TFT-To/
