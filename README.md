@@ -23,7 +23,7 @@ El uso prolongado de pantallas (celulares) genera en los preadolescentes un patr
 El uso de tecnologías adecuadas y adaptadas para preadolescentes puede contribuir a disminuir los efectos negativos asociados a la dependencia y el uso excesivo de pantallas.
 
 ## Objetivo 
-Diseñar y desarrollar un dispositivo lúdico para preadolescentes de entre 9 y 12 años, orientado a promover su interacción social mediante actividades colaborativas, evaluando su funcionamiento a través de pruebas con usuarios (participantes) de distintas edades.
+Desarrollar un dispositivo lúdico dirigido a preadolescentes de 7 a 10 años que promueva la interacción social y exploración a través del juego colaborativo.
 
 ## Usuarios y contexto
 
