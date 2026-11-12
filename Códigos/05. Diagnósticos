@@ -4,7 +4,7 @@
 **Resultados:**
 
 
-**Código :**
+**Código A:**
 
 #include <Wire.h>
 
@@ -58,3 +58,118 @@ void loop() {
 
   delay(5000);
 }
+
+**Código B:**
+/*
+  Prueba y diagnostico SOLO del sensor TCS34725 con ESP32
+  Conexion: VIN=3V3  GND=GND  SDA=GPIO 21  SCL=GPIO 22
+  Libreria: Adafruit TCS34725 (y Adafruit BusIO)
+  Monitor Serie a 115200 baudios.
+
+  Que hace:
+   1) Escanea el bus I2C probando 3 configuraciones (normal, lenta, SDA/SCL invertidos)
+   2) Si el sensor responde, lee su ID y empieza a mostrar colores
+   3) Si no responde, lo indica y repite el diagnostico cada 5 segundos
+*/
+
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+
+#define PIN_SDA 21
+#define PIN_SCL 22
+#define DIR_SENSOR 0x29
+
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+bool sensorOK = false;
+unsigned long ultimaLectura = 0;
+unsigned long ultimoDiagnostico = 0;
+
+struct Intento {
+  int sda;
+  int scl;
+  uint32_t freq;
+  const char *nombre;
+};
+
+Intento intentos[] = {
+  {PIN_SDA, PIN_SCL, 100000, "Normal (100 kHz)"},
+  {PIN_SDA, PIN_SCL, 10000,  "Lenta (10 kHz)"},
+  {PIN_SCL, PIN_SDA, 100000, "SDA y SCL invertidos"}
+};
+
+// Escanea el bus y devuelve cuantos dispositivos encontro
+int escanear(const Intento &it) {
+  Wire.end();
+  Wire.begin(it.sda, it.scl, it.freq);
+  delay(50);
+  int n = 0;
+  for (byte dir = 1; dir < 127; dir++) {
+    Wire.beginTransmission(dir);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("   Dispositivo en 0x%02X\n", dir);
+      n++;
+    }
+  }
+  return n;
+}
+
+// Lee el registro de identidad del chip (0x12). Debe dar 0x44 o 0x4D
+int leerID() {
+  Wire.beginTransmission(DIR_SENSOR);
+  Wire.write(0x80 | 0x12);
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom(DIR_SENSOR, 1) != 1) return -1;
+  return Wire.read();
+}
+
+bool diagnosticar() {
+  Serial.println("\n=== Diagnostico I2C ===");
+  for (Intento &it : intentos) {
+    Serial.printf("Probando: %s (SDA=%d, SCL=%d)\n", it.nombre, it.sda, it.scl);
+    int n = escanear(it);
+    if (n == 0) {
+      Serial.println("   Sin respuesta");
+      continue;
+    }
+
+    int id = leerID();
+    Serial.printf("   ID del chip: 0x%02X\n", id);
+
+    if (tcs.begin(DIR_SENSOR, &Wire)) {
+      Serial.println(">>> Sensor TCS34725 funcionando");
+      return true;
+    }
+    Serial.println("   Hay respuesta, pero la libreria no lo acepta (revisa el ID)");
+  }
+  Serial.println(">>> El sensor NO responde en ninguna configuracion");
+  return false;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  sensorOK = diagnosticar();
+}
+
+void loop() {
+  if (sensorOK) {
+    if (millis() - ultimaLectura >= 500) {
+      ultimaLectura = millis();
+
+      uint16_t r, g, b, c;
+      tcs.getRawData(&r, &g, &b, &c);
+
+      const char *dominante = "---";
+      if (c > 100) {
+        if (r >= g && r >= b) dominante = "rojo";
+        else if (g >= r && g >= b) dominante = "verde";
+        else dominante = "azul";
+      }
+      Serial.printf("R:%u  G:%u  B:%u  C:%u  -> predomina: %s\n", r, g, b, c, dominante);
+    }
+  } else if (millis() - ultimoDiagnostico >= 5000) {
+    ultimoDiagnostico = millis();
+    sensorOK = diagnosticar();
+  }
+}
+
