@@ -1,0 +1,1753 @@
+**Descripción:**
+
+**Resultados:**
+
+
+**Código :**
+
+/*
+  OV7670 sin FIFO + GC9A01 240x240
+  ESP32 DevKit V1 - Arduino ESP32 core 3.3.12
+
+  Captura basada en bitluni/ESP32CameraI2S.
+  Sin WiFi, sin servidor web y sin almacenamiento.
+
+  + Sensor de color TCS34725 (I2C por hardware, pines propios):
+    SDA = GPIO 4, SCL = GPIO 15, VIN = 3V3, GND = GND.
+    OJO: GPIO 21 y 22 ya los usa la camara (D6 y D5), por eso el sensor no puede ir ahi.
+  La pantalla muestra el video en el centro; arriba una muestra del color detectado
+  y abajo su nombre.
+
+  PANTALLAS (todo se dibuja dentro del círculo de la pantalla GC9A01):
+  - INICIO : "Cazador de colores" (letras de colores) y "by 404" abajo en blanco.
+             Cualquier pulsación de JUEGO o ARCHIVO lleva al menú.
+  - MENÚ   : A_JUEGO (boton JUEGO) -> elegir modo | B_ARCHIVO (boton ARCHIVO) -> listado.
+  - MODOS  : A_CAPTURA (boton JUEGO) | B_ADIVINA (boton ARCHIVO) | CAPTURA vuelve al menu.
+             Al elegir modo aparece una breve instruccion; cualquier boton la cierra.
+  - JUEGO  : CAPTURA guarda el color; JUEGO o ARCHIVO vuelven al menú.
+  - ADIVINA: sale una adivinanza al azar; hay que capturar ese color con el sensor.
+             Solo si coincide se suma a la lista. JUEGO vuelve al menu; ARCHIVO repite la adivinanza.
+  - ARCHIVO: solo colores con conteo distinto de 0, 3 filas visibles. ARCHIVO baja
+             de a uno (la fila activa: fondo blanco, letras del color que nombra);
+             JUEGO vuelve al menú.
+
+  IMPORTANTE:
+  - Este código está dirigido al ESP32 clásico.
+  - Requiere la librería GFX Library for Arduino.
+*/
+
+#include <Arduino.h>
+#include <Arduino_GFX_Library.h>
+#include <driver/gpio.h>
+#include <driver/ledc.h>
+#include <driver/periph_ctrl.h>
+#include <esp_intr_alloc.h>
+#include <esp_heap_caps.h>
+#include <esp_random.h>
+#include <rom/lldesc.h>
+#include <soc/soc.h>
+#include <soc/gpio_sig_map.h>
+#include <soc/i2s_reg.h>
+#include <soc/i2s_struct.h>
+#include "soc/gpio_struct.h"
+#include <Wire.h>
+#include <LittleFS.h>
+#include "Adafruit_TCS34725.h"
+
+// --------------------------------------------------
+// PINES DE LA PANTALLA GC9A01
+// --------------------------------------------------
+
+#define TFT_SCLK 18
+#define TFT_MOSI 23
+#define TFT_CS    5
+#define TFT_DC   16
+#define TFT_RST  17
+
+Arduino_DataBus *tftBus =
+  new Arduino_HWSPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI);
+
+Arduino_GFX *gfx =
+  new Arduino_GC9A01(tftBus, TFT_RST, 0, true);
+
+// --------------------------------------------------
+// PINES DE LA OV7670
+// --------------------------------------------------
+
+#define CAM_SIOD  26
+#define CAM_SIOC  27
+
+#define CAM_VSYNC 25
+#define CAM_HREF  33
+#define CAM_XCLK  14
+#define CAM_PCLK  32
+
+#define CAM_D0    36
+#define CAM_D1    39
+#define CAM_D2    35
+#define CAM_D3    34
+#define CAM_D4    19
+#define CAM_D5    22
+#define CAM_D6    21
+#define CAM_D7    13
+
+// --------------------------------------------------
+// RESOLUCIÓN DE CAPTURA
+// --------------------------------------------------
+
+#define CAM_WIDTH  160
+#define CAM_HEIGHT 120
+
+// --------------------------------------------------
+// RELOJ XCLK
+// --------------------------------------------------
+
+bool clockEnable(int pin, uint32_t hz)
+{
+  if (!ledcAttach(pin, hz, 1))
+    return false;
+
+  return ledcWrite(pin, 1);
+}
+
+// --------------------------------------------------
+// I2C POR SOFTWARE PARA OV7670
+// --------------------------------------------------
+
+class CameraI2C
+{
+public:
+  int sda;
+  int scl;
+
+  CameraI2C(int dataPin, int clockPin)
+  {
+    sda = dataPin;
+    scl = clockPin;
+
+    pinMode(sda, INPUT_PULLUP);
+    pinMode(scl, INPUT_PULLUP);
+  }
+
+  void delayBit()
+  {
+    delayMicroseconds(2);
+  }
+
+  void sdaLow()
+  {
+    pinMode(sda, OUTPUT);
+    digitalWrite(sda, LOW);
+  }
+
+  void sdaHigh()
+  {
+    pinMode(sda, INPUT_PULLUP);
+  }
+
+  void sclLow()
+  {
+    pinMode(scl, OUTPUT);
+    digitalWrite(scl, LOW);
+  }
+
+  void sclHigh()
+  {
+    pinMode(scl, INPUT_PULLUP);
+  }
+
+  void start()
+  {
+    sdaHigh();
+    sclHigh();
+    delayBit();
+    sdaLow();
+    delayBit();
+    sclLow();
+  }
+
+  void stop()
+  {
+    sdaLow();
+    sclHigh();
+    delayBit();
+    sdaHigh();
+    delayBit();
+  }
+
+  bool writeByte(uint8_t value)
+  {
+    for (int i = 0; i < 8; i++)
+    {
+      if (value & 0x80)
+        sdaHigh();
+      else
+        sdaLow();
+
+      value <<= 1;
+
+      delayBit();
+      sclHigh();
+      delayBit();
+      sclLow();
+    }
+
+    sdaHigh();
+    delayBit();
+    sclHigh();
+    delayBit();
+
+    bool ack = (digitalRead(sda) == LOW);
+
+    sclLow();
+    return ack;
+  }
+
+  bool writeRegister(uint8_t address, uint8_t reg, uint8_t value)
+  {
+    start();
+
+    bool ok = writeByte(address);
+    if (ok) ok = writeByte(reg);
+    if (ok) ok = writeByte(value);
+
+    stop();
+    return ok;
+  }
+};
+
+CameraI2C cameraI2C(CAM_SIOD, CAM_SIOC);
+
+// --------------------------------------------------
+// DMA
+// --------------------------------------------------
+
+struct CameraDMABuffer
+{
+  lldesc_t descriptor;
+  uint8_t *buffer;
+
+  CameraDMABuffer(int bytes)
+  {
+    buffer = (uint8_t *)heap_caps_malloc(
+      bytes,
+      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+    );
+
+    memset(&descriptor, 0, sizeof(descriptor));
+
+    descriptor.length = bytes;
+    descriptor.size = bytes;
+    descriptor.owner = 1;
+    descriptor.sosf = 1;
+    descriptor.buf = buffer;
+    descriptor.offset = 0;
+    descriptor.eof = 1;
+    descriptor.qe.stqe_next = nullptr;
+  }
+
+  void next(CameraDMABuffer *other)
+  {
+    descriptor.qe.stqe_next = &other->descriptor;
+  }
+};
+
+CameraDMABuffer *dmaBuffers[2] = {nullptr, nullptr};
+
+volatile int dmaActive = 0;
+volatile int blocksReceived = 0;
+
+uint8_t *cameraFrame = nullptr;
+
+volatile int framePointer = 0;
+int frameBytes = CAM_WIDTH * CAM_HEIGHT * 2;
+
+volatile bool stopRequested = false;
+volatile bool frameComplete = false;
+
+intr_handle_t i2sInterruptHandle = nullptr;
+intr_handle_t vsyncInterruptHandle = nullptr;
+
+// --------------------------------------------------
+// REINICIO DE I2S
+// --------------------------------------------------
+
+void i2sReset()
+{
+  const uint32_t lcFlags =
+    I2S_IN_RST_M |
+    I2S_AHBM_RST_M |
+    I2S_AHBM_FIFO_RST_M;
+
+  I2S0.lc_conf.val |= lcFlags;
+  I2S0.lc_conf.val &= ~lcFlags;
+
+  const uint32_t confFlags =
+    I2S_RX_RESET_M |
+    I2S_RX_FIFO_RESET_M |
+    I2S_TX_RESET_M |
+    I2S_TX_FIFO_RESET_M;
+
+  I2S0.conf.val |= confFlags;
+  I2S0.conf.val &= ~confFlags;
+
+  while (I2S0.state.rx_fifo_reset_back) {}
+}
+
+// --------------------------------------------------
+// INTERRUPCIÓN I2S
+// --------------------------------------------------
+
+void IRAM_ATTR cameraI2SInterrupt(void *arg)
+{
+  I2S0.int_clr.val = I2S0.int_raw.val;
+
+  blocksReceived++;
+
+  uint8_t *buf = dmaBuffers[dmaActive]->buffer;
+
+  dmaActive = (dmaActive + 1) % 2;
+
+  if (framePointer < frameBytes)
+  {
+    for (int i = 0; i < CAM_WIDTH * 4; i += 4)
+    {
+      cameraFrame[framePointer++] = buf[i + 2];
+      cameraFrame[framePointer++] = buf[i];
+    }
+  }
+
+  if (blocksReceived >= CAM_HEIGHT)
+  {
+    framePointer = 0;
+    blocksReceived = 0;
+
+    frameComplete = true;
+
+    if (stopRequested)
+    {
+      esp_intr_disable(i2sInterruptHandle);
+      esp_intr_disable(vsyncInterruptHandle);
+
+      I2S0.conf.rx_start = 0;
+      stopRequested = false;
+    }
+  }
+}
+
+// --------------------------------------------------
+// INTERRUPCIÓN VSYNC
+// --------------------------------------------------
+
+void IRAM_ATTR cameraVSyncInterrupt(void *arg)
+{
+  GPIO.status_w1tc = (1U << CAM_VSYNC);
+}
+
+// --------------------------------------------------
+// CONFIGURACIÓN DE ENTRADAS I2S
+// --------------------------------------------------
+
+bool cameraI2SInit()
+{
+  int pins[] =
+  {
+    CAM_VSYNC,
+    CAM_HREF,
+    CAM_PCLK,
+    CAM_D0,
+    CAM_D1,
+    CAM_D2,
+    CAM_D3,
+    CAM_D4,
+    CAM_D5,
+    CAM_D6,
+    CAM_D7
+  };
+
+  gpio_config_t conf = {};
+  conf.mode = GPIO_MODE_INPUT;
+  conf.pull_up_en = GPIO_PULLUP_DISABLE;
+  conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  conf.intr_type = GPIO_INTR_DISABLE;
+
+  for (int i = 0; i < 11; i++)
+  {
+    conf.pin_bit_mask = 1ULL << pins[i];
+
+    if (gpio_config(&conf) != ESP_OK)
+      return false;
+  }
+
+  gpio_matrix_in(CAM_D0, I2S0I_DATA_IN0_IDX, false);
+  gpio_matrix_in(CAM_D1, I2S0I_DATA_IN1_IDX, false);
+  gpio_matrix_in(CAM_D2, I2S0I_DATA_IN2_IDX, false);
+  gpio_matrix_in(CAM_D3, I2S0I_DATA_IN3_IDX, false);
+  gpio_matrix_in(CAM_D4, I2S0I_DATA_IN4_IDX, false);
+  gpio_matrix_in(CAM_D5, I2S0I_DATA_IN5_IDX, false);
+  gpio_matrix_in(CAM_D6, I2S0I_DATA_IN6_IDX, false);
+  gpio_matrix_in(CAM_D7, I2S0I_DATA_IN7_IDX, false);
+
+  gpio_matrix_in(0x30, I2S0I_DATA_IN8_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN9_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN10_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN11_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN12_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN13_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN14_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN15_IDX, false);
+
+  gpio_matrix_in(CAM_VSYNC, I2S0I_V_SYNC_IDX, true);
+  gpio_matrix_in(0x38, I2S0I_H_SYNC_IDX, false);
+  gpio_matrix_in(CAM_HREF, I2S0I_H_ENABLE_IDX, false);
+  gpio_matrix_in(CAM_PCLK, I2S0I_WS_IN_IDX, false);
+
+  periph_module_enable(PERIPH_I2S0_MODULE);
+
+  i2sReset();
+
+  I2S0.conf.rx_slave_mod = 1;
+  I2S0.conf2.lcd_en = 1;
+  I2S0.conf2.camera_en = 1;
+
+  I2S0.clkm_conf.clkm_div_a = 1;
+  I2S0.clkm_conf.clkm_div_b = 0;
+  I2S0.clkm_conf.clkm_div_num = 2;
+
+  I2S0.fifo_conf.dscr_en = 1;
+I2S0.fifo_conf.rx_fifo_mod = 1;
+
+  I2S0.fifo_conf.rx_fifo_mod_force_en = 1;
+  I2S0.conf_chan.rx_chan_mod = 1;
+
+  I2S0.sample_rate_conf.rx_bits_mod = 0;
+  I2S0.conf.rx_right_first = 0;
+  I2S0.conf.rx_msb_right = 0;
+  I2S0.conf.rx_msb_shift = 0;
+  I2S0.conf.rx_mono = 0;
+  I2S0.conf.rx_short_sync = 0;
+  I2S0.timing.val = 0;
+
+  return true;
+}
+
+// --------------------------------------------------
+// INICIALIZACIÓN DMA
+// --------------------------------------------------
+
+bool cameraDMAInit()
+{
+  const int dmaBytes = CAM_WIDTH * 4;
+
+  for (int i = 0; i < 2; i++)
+  {
+    dmaBuffers[i] = new CameraDMABuffer(dmaBytes);
+
+    if (!dmaBuffers[i]->buffer)
+      return false;
+  }
+
+  dmaBuffers[0]->next(dmaBuffers[1]);
+  dmaBuffers[1]->next(dmaBuffers[0]);
+
+  return true;
+}
+
+// --------------------------------------------------
+// ARRANQUE DE CAPTURA
+// --------------------------------------------------
+
+bool cameraCaptureStart()
+{
+  uint32_t startTime = millis();
+
+  Serial.print("VSYNC inicial: ");
+  Serial.println(digitalRead(CAM_VSYNC));
+
+  while (digitalRead(CAM_VSYNC) == LOW)
+  {
+    if (millis() - startTime > 1000)
+    {
+      Serial.println("ERROR: VSYNC nunca subio a HIGH");
+      return false;
+    }
+  }
+
+  Serial.println("VSYNC paso a HIGH");
+
+  while (digitalRead(CAM_VSYNC) == HIGH)
+  {
+    if (millis() - startTime > 1500)
+    {
+      Serial.println("ERROR: VSYNC nunca volvio a LOW");
+      return false;
+    }
+  }
+
+  Serial.println("VSYNC paso a LOW");
+
+  esp_intr_disable(i2sInterruptHandle);
+
+  i2sReset();
+
+  blocksReceived = 0;
+  dmaActive = 0;
+  framePointer = 0;
+  frameComplete = false;
+  stopRequested = true;
+
+  I2S0.rx_eof_num = dmaBuffers[0]->descriptor.length / 4;
+
+  I2S0.in_link.addr =
+    (uint32_t)&dmaBuffers[0]->descriptor;
+
+  I2S0.in_link.start = 1;
+
+  I2S0.int_clr.val = I2S0.int_raw.val;
+  I2S0.int_ena.val = 0;
+  I2S0.int_ena.in_done = 1;
+
+  esp_intr_enable(i2sInterruptHandle);
+  esp_intr_enable(vsyncInterruptHandle);
+
+  I2S0.conf.rx_start = 1;
+
+  Serial.println("I2S iniciado; esperando captura...");
+  return true;
+}
+
+// --------------------------------------------------
+// CAPTURA DE UN FOTOGRAMA
+// --------------------------------------------------
+
+bool cameraCaptureFrame()
+{
+  if (!cameraCaptureStart())
+    return false;
+
+  uint32_t startTime = millis();
+
+  while (stopRequested)
+  {
+    if (millis() - startTime > 1500)
+    {
+      Serial.println("ERROR: tiempo agotado esperando captura");
+Serial.print("Bloques recibidos: ");
+Serial.println(blocksReceived);
+Serial.print("Bytes recibidos: ");
+Serial.println(framePointer);
+Serial.print("VSYNC actual: ");
+Serial.println(digitalRead(CAM_VSYNC));
+Serial.print("I2S int_raw: ");
+Serial.println(I2S0.int_raw.val, HEX);
+      esp_intr_disable(i2sInterruptHandle);
+      esp_intr_disable(vsyncInterruptHandle);
+
+      I2S0.conf.rx_start = 0;
+      stopRequested = false;
+
+      return false;
+    }
+
+    delay(1);
+  }
+
+  return frameComplete;
+}
+
+// --------------------------------------------------
+// CONFIGURACIÓN OV7670
+// --------------------------------------------------
+
+bool cameraConfigure()
+{
+  if (!clockEnable(CAM_XCLK, 20000000))
+    return false;
+  delay(200);
+
+Serial.println("Probando SCCB con XCLK activo...");
+
+cameraI2C.start();
+bool ack = cameraI2C.writeByte(0x42);
+cameraI2C.stop();
+
+if (ack)
+{
+  Serial.println("OK: OV7670 responde por SCCB");
+}
+else
+{
+  Serial.println("ERROR: sin respuesta SCCB con XCLK activo");
+  return false;
+}
+
+  pinMode(CAM_VSYNC, INPUT);
+
+  uint32_t startTime = millis();
+
+  while (!digitalRead(CAM_VSYNC))
+  {
+    if (millis() - startTime > 2000)
+      return false;
+  }
+
+  while (digitalRead(CAM_VSYNC))
+  {
+    if (millis() - startTime > 2500)
+      return false;
+  }
+
+  // Reinicio de registros de cámara
+  Serial.println("Enviando reinicio a OV7670...");
+   Serial.println("Resultado del reinicio SCCB");
+  Serial.println("Probando escritura del registro COM7...");
+
+cameraI2C.start();
+
+bool ack1 = cameraI2C.writeByte(0x42);
+cameraI2C.delayBit();
+
+bool ack2 = cameraI2C.writeByte(0x12);
+cameraI2C.delayBit();
+
+bool ack3 = cameraI2C.writeByte(0x80);
+
+cameraI2C.stop();
+
+Serial.print("Respuesta direccion 0x42: ");
+Serial.println(ack1 ? "OK" : "FALLO");
+
+Serial.print("Respuesta registro 0x12: ");
+Serial.println(ack2 ? "OK" : "FALLO");
+
+Serial.print("Respuesta dato 0x80: ");
+Serial.println(ack3 ? "OK" : "FALLO");
+
+if (!ack1 || !ack2 || !ack3)
+{
+  Serial.println("ERROR: fallo en escritura SCCB");
+  return false;
+}
+
+Serial.println("Reinicio de registros enviado.");
+delay(100);
+
+ // Formato RGB
+cameraI2C.writeRegister(0x42, 0x12, 0x04);
+cameraI2C.writeRegister(0x42, 0x40, 0xD0);
+
+// Reloj y exposición
+cameraI2C.writeRegister(0x42, 0x11, 0x80);
+cameraI2C.writeRegister(0x42, 0x3B, 0x0A);
+
+// Escalado QQVGA 160x120
+cameraI2C.writeRegister(0x42, 0x0C, 0x04);
+cameraI2C.writeRegister(0x42, 0x3E, 0x1A);
+cameraI2C.writeRegister(0x42, 0x70, 0x3A);
+cameraI2C.writeRegister(0x42, 0x71, 0x35);
+cameraI2C.writeRegister(0x42, 0x72, 0x22);
+cameraI2C.writeRegister(0x42, 0x73, 0xF2);
+cameraI2C.writeRegister(0x42, 0xA2, 0x02);
+
+  // Ventana de imagen
+  cameraI2C.writeRegister(0x42, 0x17, 196 >> 3);
+  cameraI2C.writeRegister(0x42, 0x18, 52 >> 3);
+  cameraI2C.writeRegister(0x42, 0x32, ((52 & 7) << 3) | (196 & 7));
+
+  cameraI2C.writeRegister(0x42, 0x19, 8 >> 2);
+  cameraI2C.writeRegister(0x42, 0x1A, 488 >> 2);
+  cameraI2C.writeRegister(0x42, 0x03, ((488 & 3) << 2) | (8 & 3));
+
+  // Ajuste de color
+cameraI2C.writeRegister(0x42, 0xB0, 0x84);
+cameraI2C.writeRegister(0x42, 0x4F, 0x80);
+cameraI2C.writeRegister(0x42, 0x50, 0x80);
+cameraI2C.writeRegister(0x42, 0x51, 0x00);
+cameraI2C.writeRegister(0x42, 0x52, 0x22);
+cameraI2C.writeRegister(0x42, 0x53, 0x5E);
+cameraI2C.writeRegister(0x42, 0x54, 0x80);
+cameraI2C.writeRegister(0x42, 0x58, 0x9E);
+
+cameraI2C.writeRegister(0x42, 0x13, 0xE7);
+cameraI2C.writeRegister(0x42, 0x6F, 0x9F);
+
+  return true;
+}
+
+// --------------------------------------------------
+// INICIALIZACIÓN GENERAL DE CÁMARA
+// --------------------------------------------------
+
+bool cameraBegin()
+{
+  Serial.println("Iniciando reloj XCLK...");
+
+  if (!cameraConfigure())
+  {
+    Serial.println("ERROR: no se pudo iniciar la OV7670.");
+    return false;
+  }
+
+  Serial.println("Configurando memoria de imagen...");
+
+Serial.printf("RAM interna libre: %u bytes\n",
+  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+Serial.printf("Bloque contiguo mayor: %u bytes\n",
+  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cameraFrame = (uint8_t *)heap_caps_malloc(
+    frameBytes,
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+  );
+
+  if (!cameraFrame)
+  {
+    Serial.println("ERROR: no hay memoria para el fotograma.");
+    return false;
+  }
+
+  if (!cameraI2SInit())
+  {
+    Serial.println("ERROR: inicialización I2S.");
+    return false;
+  }
+
+  if (!cameraDMAInit())
+  {
+    Serial.println("ERROR: inicialización DMA.");
+    return false;
+  }
+
+  gpio_set_intr_type(
+    (gpio_num_t)CAM_VSYNC,
+    GPIO_INTR_POSEDGE
+  );
+
+  gpio_intr_enable((gpio_num_t)CAM_VSYNC);
+
+  if (gpio_isr_register(
+        &cameraVSyncInterrupt,
+        nullptr,
+        ESP_INTR_FLAG_INTRDISABLED | ESP_INTR_FLAG_IRAM,
+        &vsyncInterruptHandle) != ESP_OK)
+  {
+    Serial.println("ERROR: interrupción VSYNC.");
+    return false;
+  }
+
+  if (esp_intr_alloc(
+        ETS_I2S0_INTR_SOURCE,
+        ESP_INTR_FLAG_INTRDISABLED |
+        ESP_INTR_FLAG_LEVEL1 |
+        ESP_INTR_FLAG_IRAM,
+        &cameraI2SInterrupt,
+        nullptr,
+        &i2sInterruptHandle) != ESP_OK)
+  {
+    Serial.println("ERROR: interrupción I2S.");
+    return false;
+  }
+
+  Serial.println("Cámara preparada.");
+  return true;
+}
+
+// --------------------------------------------------
+// SENSOR DE COLOR TCS34725
+// --------------------------------------------------
+// Pines I2C del sensor (distintos de los de la camara).
+// Alternativa: compartir el bus SCCB de la camara con SENSOR_SDA 26 y SENSOR_SCL 27
+// (el sensor tendria que ir soldado/conectado a esas mismas lineas).
+
+#define SENSOR_SDA 4
+#define SENSOR_SCL 15
+
+Adafruit_TCS34725 tcs =
+  Adafruit_TCS34725(
+    TCS34725_INTEGRATIONTIME_50MS,
+    TCS34725_GAIN_4X
+  );
+
+bool sensorOK = false;
+
+unsigned long ultimaLectura = 0;
+
+// Cada cuanto se lee el color (el codigo original del sensor usaba 5000 ms)
+const unsigned long INTERVALO_COLOR = 500;
+
+// --------------------------------------------------
+// CONTROLES Y ESTADO DEL JUEGO
+// --------------------------------------------------
+// Pulsadores activos en LOW: conectar cada pulsador entre GPIO y GND, sin resistencia
+// pull-up externa (se usa el INPUT_PULLUP interno).
+// GPIO 0 y 12 son pines de arranque (strapping): no mantenerlos pulsados al encender.
+// GPIO 3 comparte UART0 RX: Serial se desactiva al terminar setup().
+#define BTN_MENU    0    // boton de JUEGO
+#define BTN_ARCHIVO 12   // boton de ARCHIVO (antes GPIO 2)
+#define BTN_CAPTURA 3    // boton de CAPTURA
+
+enum EstadoPantalla {
+  PANTALLA_INICIO,
+  PANTALLA_MENU,
+  PANTALLA_MODOS,        // A_CAPTURA / B_ADIVINA
+  PANTALLA_INSTRUCCION,  // instruccion breve del modo elegido
+  PANTALLA_ADIVINANZA,   // texto de la adivinanza (modo ADIVINA)
+  PANTALLA_JUEGO,        // camara + sensor (ambos modos)
+  PANTALLA_ARCHIVO
+};
+
+enum ModoJuego { MODO_CAPTURA, MODO_ADIVINA };
+ModoJuego modoJuego = MODO_CAPTURA;
+EstadoPantalla pantallaActual = PANTALLA_INICIO;
+
+struct EstadoBoton {
+  uint8_t pin;
+  bool lecturaAnterior;
+  bool estadoEstable;
+  unsigned long cambio;
+};
+
+EstadoBoton botones[3] = {
+  { BTN_MENU, true, true, 0 },
+  { BTN_ARCHIVO, true, true, 0 },
+  { BTN_CAPTURA, true, true, 0 }
+};
+
+const unsigned long ANTIRREBOTE_MS = 45;
+bool almacenamientoOK = false;
+
+const char *NOMBRES_COLORES[] = {
+  "NEGRO", "GRIS", "BLANCO", "ROJO", "ROSADO", "NARANJA",
+  "AMARILLO", "VERDE", "TURQUESA", "AZUL", "MORADO"
+};
+const uint8_t TOTAL_COLORES = sizeof(NOMBRES_COLORES) / sizeof(NOMBRES_COLORES[0]);
+uint32_t conteosColores[TOTAL_COLORES] = {0};
+
+char colorActual[16] = "SIN SENSOR";
+uint16_t muestraActual = 0x0000;
+bool colorValido = false;
+uint32_t totalCapturas = 0;
+
+#define COLOR_NEGRO  0x0000
+#define COLOR_BLANCO 0xFFFF
+#define COLOR_GRIS   0x4208
+#define COLOR_CYAN   0x07FF
+#define COLOR_ROJO   0xF800
+#define COLOR_VERDE  0x07E0
+
+// --------------------------------------------------
+// ADIVINANZAS (modo B_ADIVINA)
+// --------------------------------------------------
+// La fuente de la pantalla es ASCII: sin tildes ni enie. "color" debe ser
+// uno de los nombres de NOMBRES_COLORES.
+struct Adivinanza {
+  const char *texto;
+  const char *color;
+};
+
+const Adivinanza ADIVINANZAS[] = {
+  { "Estoy en el platano y el limon...",                    "AMARILLO" },
+  { "Salgo de dia y me oculto de noche, en el cielo...",    "AMARILLO" },
+  { "Me hallas en el cielo despejado y en el mar...",       "AZUL" },
+  { "Soy el color de los arandanos y los dias claros...",   "AZUL" },
+  { "Me ves en las manzanas y en el amor...",               "ROJO" },
+  { "Soy el color de las frutillas y los tomates...",       "ROJO" },
+  { "Me encuentras en los arboles y el pasto...",           "VERDE" },
+  { "Soy el color del brocoli y la palta...",               "VERDE" },
+  { "Soy el color de zanahorias y mandarinas...",           "NARANJA" },
+  { "Soy el color de la nieve y las nubes...",              "BLANCO" },
+  { "Soy el color de la noche sin luz...",                  "NEGRO" }
+};
+const uint8_t TOTAL_ADIVINANZAS = sizeof(ADIVINANZAS) / sizeof(ADIVINANZAS[0]);
+
+uint8_t adivinanzaActual = 255;   // indice en ADIVINANZAS (255 = ninguna todavia)
+int adivinanzaColor = -1;         // indice en NOMBRES_COLORES del color buscado
+
+// --------------------------------------------------
+// GEOMETRIA DE LA PANTALLA CIRCULAR (240x240, radio real = 120 px)
+// --------------------------------------------------
+// Todo debe quedar dentro de un circulo de radio RADIO_SEGURO (~10 px de margen
+// contra el borde). anchoDisponible() entrega el ancho horizontal util entre dos
+// alturas, y los helpers de texto reducen el tamano de letra si algo no cabe.
+const int CENTRO_X = 120;
+const int CENTRO_Y = 120;
+const int RADIO_SEGURO = 110;
+
+int anchoDisponible(int yArriba, int yAbajo)
+{
+  int dy = max(abs(yArriba - CENTRO_Y), abs(yAbajo - CENTRO_Y));
+  if (dy >= RADIO_SEGURO) return 0;
+  return 2 * (int)sqrtf((float)(RADIO_SEGURO * RADIO_SEGURO - dy * dy));
+}
+
+// Fuente base: 6 px de ancho y 8 px de alto por cada unidad de tamano.
+uint8_t ajustarTamano(size_t letras, int yArriba, uint8_t tam)
+{
+  while (tam > 1 && (int)(letras * 6 * tam) > anchoDisponible(yArriba, yArriba + 8 * tam)) tam--;
+  return tam;
+}
+
+void textoCentrado(const char *texto, int yArriba, uint8_t tam, uint16_t color)
+{
+  size_t n = strlen(texto);
+  tam = ajustarTamano(n, yArriba, tam);
+  int ancho = (int)(n * 6 * tam) - tam;
+
+  gfx->setTextSize(tam);
+  gfx->setTextColor(color);
+  gfx->setCursor(CENTRO_X - ancho / 2, yArriba);
+  gfx->print(texto);
+}
+
+// Texto centrado con cada letra de un color distinto (los espacios no cuentan).
+// 'k' es el indice de color con el que parte; devuelve el siguiente para encadenar lineas.
+uint8_t textoMulticolor(const char *texto, int yArriba, uint8_t tam, uint8_t k)
+{
+  const uint16_t paleta[8] = {
+    gfx->color565(255,  70,  70),   // rojo
+    gfx->color565(255, 150,   0),   // naranja
+    gfx->color565(255, 230,   0),   // amarillo
+    gfx->color565( 60, 220,  60),   // verde
+    gfx->color565(  0, 220, 255),   // turquesa
+    gfx->color565( 80, 120, 255),   // azul
+    gfx->color565(180,  90, 255),   // morado
+    gfx->color565(255,  90, 200)    // rosado
+  };
+
+  size_t n = strlen(texto);
+  tam = ajustarTamano(n, yArriba, tam);
+  int paso = 6 * tam;
+  int x0 = CENTRO_X - ((int)(n * paso) - tam) / 2;
+
+  gfx->setTextSize(tam);
+  for (size_t i = 0; i < n; i++) {
+    if (texto[i] == ' ') continue;
+    gfx->setTextColor(paleta[k % 8]);
+    gfx->setCursor(x0 + (int)i * paso, yArriba);
+    gfx->print(texto[i]);
+    k++;
+  }
+  return k;
+}
+
+// Escribe un texto largo en varias lineas centradas, cortando por palabras y
+// respetando el ancho del circulo en cada altura. Devuelve la y donde termina.
+// Con dibujar = false solo mide (sirve para elegir el tamano de letra).
+int envolverTexto(const char *texto, int yInicio, uint8_t tam, int paso, uint16_t color, bool dibujar)
+{
+  char buf[160];
+  strncpy(buf, texto, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  char *p = buf;
+  int y = yInicio;
+
+  while (*p) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+
+    int maxCh = anchoDisponible(y, y + 8 * tam) / (6 * tam);
+    if (maxCh < 4) break;                       // ya no hay espacio en el circulo
+
+    int largo = strlen(p);
+    int corte = largo;
+    if (largo > maxCh) {
+      corte = maxCh;
+      while (corte > 0 && p[corte] != ' ') corte--;
+      if (corte == 0) corte = maxCh;            // palabra mas larga que la linea
+    }
+
+    if (dibujar) {
+      char linea[40];
+      int n = min(corte, 39);
+      memcpy(linea, p, n);
+      while (n > 0 && linea[n - 1] == ' ') n--;
+      linea[n] = '\0';
+      textoCentrado(linea, y, tam, color);
+    }
+
+    p += corte;
+    y += paso;
+  }
+  return y;
+}
+
+// Texto largo en tamano 2; si no cabe antes de yMax, baja a tamano 1.
+void textoLargo(const char *texto, int yInicio, int yMax, uint16_t color)
+{
+  uint8_t tam = 2;
+  if (envolverTexto(texto, yInicio, 2, 19, color, false) > yMax) tam = 1;
+  envolverTexto(texto, yInicio, tam, (tam == 2) ? 19 : 11, color, true);
+}
+
+// --------------------------------------------------
+// LISTADO DE ARCHIVO (solo colores con conteo distinto de 0, 3 filas visibles)
+// --------------------------------------------------
+const uint8_t FILAS_ARCHIVO = 3;
+const int ARCH_Y0    = 60;    // y de la primera fila
+const int ARCH_ALTO  = 36;    // alto de cada fila
+const int ARCH_PASO  = 42;    // distancia entre filas
+const int ARCH_ANCHO = 180;   // ancho maximo de cada fila
+
+uint8_t listaArchivo[TOTAL_COLORES];   // indices de NOMBRES_COLORES con conteo > 0
+uint8_t totalListaArchivo = 0;
+uint8_t seleccionArchivo = 0;          // posicion dentro de listaArchivo
+
+// =====================================================
+// FUNCIÓN: DETECTAR COLOR
+// =====================================================
+
+const char* detectarColor(
+  int rojo,
+  int verde,
+  int azul
+) {
+
+  // ---------------------------------------------------
+  // BUSCAR EL VALOR MÁXIMO Y MÍNIMO
+  // ---------------------------------------------------
+
+  int maximo = max(rojo, max(verde, azul));
+  int minimo = min(rojo, min(verde, azul));
+
+  int diferencia = maximo - minimo;
+
+
+  // ---------------------------------------------------
+  // BRILLO MUY BAJO
+  // ---------------------------------------------------
+
+  if (maximo < 25) {
+    return "NEGRO";
+  }
+
+
+  // ---------------------------------------------------
+  // GRIS
+  // ---------------------------------------------------
+
+  // Si los tres canales son parecidos
+  if (diferencia < 25) {
+
+    if (maximo < 80) {
+      return "GRIS";
+    }
+
+    return "BLANCO";
+  }
+
+
+  // ---------------------------------------------------
+  // BLANCO
+  // ---------------------------------------------------
+
+  if (minimo > 170 &&
+      diferencia < 70) {
+
+    return "BLANCO";
+  }
+
+
+  // ---------------------------------------------------
+  // CALCULAR TONO HUE
+  // ---------------------------------------------------
+
+  float h = 0;
+
+  if (diferencia == 0) {
+
+    h = 0;
+
+  } else if (maximo == rojo) {
+
+    h = 60.0 * (
+      (float)(verde - azul) / diferencia
+    );
+
+    if (h < 0) {
+      h += 360;
+    }
+
+  } else if (maximo == verde) {
+
+    h = 60.0 * (
+      (float)(azul - rojo) / diferencia
+    ) + 120;
+
+  } else {
+
+    h = 60.0 * (
+      (float)(rojo - verde) / diferencia
+    ) + 240;
+  }
+
+
+  // ---------------------------------------------------
+  // SATURACIÓN
+  // ---------------------------------------------------
+
+  float saturacion =
+    (float)diferencia / maximo;
+
+
+  // ---------------------------------------------------
+  // POCO COLOR
+  // ---------------------------------------------------
+
+  if (saturacion < 0.18) {
+
+    if (maximo < 100) {
+      return "GRIS";
+    }
+
+    return "BLANCO";
+  }
+
+
+  // ===================================================
+  // CLASIFICACIÓN
+  // ===================================================
+
+  // ---------------------------------------------------
+  // ROJO
+  // 0° aproximadamente
+  // ---------------------------------------------------
+
+  if (h >= 345 || h < 10) {
+    return "ROJO";
+  }
+
+
+  // ---------------------------------------------------
+  // ROSADO
+  // ---------------------------------------------------
+
+  if (h >= 330 && h < 345) {
+
+    if (rojo > 120) {
+      return "ROSADO";
+    }
+
+    return "ROJO";
+  }
+
+
+  // ---------------------------------------------------
+  // NARANJA
+  // ---------------------------------------------------
+
+  if (h >= 10 && h < 45) {
+    return "NARANJA";
+  }
+
+
+  // ---------------------------------------------------
+  // AMARILLO
+  // ---------------------------------------------------
+
+  if (h >= 45 && h < 75) {
+    return "AMARILLO";
+  }
+
+
+  // ---------------------------------------------------
+  // VERDE
+  // ---------------------------------------------------
+
+  if (h >= 75 && h < 165) {
+    return "VERDE";
+  }
+
+
+  // ---------------------------------------------------
+  // TURQUESA
+  // ---------------------------------------------------
+
+  if (h >= 165 && h < 195) {
+    return "TURQUESA";
+  }
+
+
+  // ---------------------------------------------------
+  // AZUL
+  // ---------------------------------------------------
+
+  if (h >= 195 && h < 255) {
+    return "AZUL";
+  }
+
+
+  // ---------------------------------------------------
+  // MORADO
+  // ---------------------------------------------------
+
+  if (h >= 255 && h < 300) {
+    return "MORADO";
+  }
+
+
+  // ---------------------------------------------------
+  // ROSADO / MAGENTA
+  // ---------------------------------------------------
+
+  if (h >= 300 && h < 345) {
+    return "ROSADO";
+  }
+
+
+  // ---------------------------------------------------
+  // SEGURIDAD
+  // ---------------------------------------------------
+
+  return "COLOR";
+}
+
+
+// --------------------------------------------------
+// MOSTRAR RESULTADO EN LAS BANDAS LIBRES DE LA PANTALLA
+// --------------------------------------------------
+// El video ocupa y = 60 a 179. Arriba (y 0-59) va la muestra de color
+// y abajo (y 180-239) va el nombre del color.
+
+
+void mostrarResultadoColor(uint16_t colorMuestra, const char *texto)
+{
+  // Banda superior: muestra del color, centrada y dentro del circulo
+  gfx->fillRect(0, 0, 240, 60, COLOR_NEGRO);
+  gfx->fillCircle(CENTRO_X, 34, 19, colorMuestra);
+  gfx->drawCircle(CENTRO_X, 34, 21, COLOR_BLANCO);
+
+  // Banda inferior: nombre del color y contador, centrados y ajustados al circulo
+  gfx->fillRect(0, 180, 240, 60, COLOR_NEGRO);
+  textoCentrado(texto, 186, 2, COLOR_BLANCO);
+
+  char cuenta[24];
+  snprintf(cuenta, sizeof(cuenta), "CAPTURAS: %lu", (unsigned long)totalCapturas);
+  textoCentrado(cuenta, 208, 1, COLOR_BLANCO);
+}
+
+void dibujarMira()
+{
+  gfx->drawCircle(120, 120, 14, COLOR_BLANCO);
+  gfx->drawFastHLine(100, 120, 10, COLOR_BLANCO);
+  gfx->drawFastHLine(130, 120, 10, COLOR_BLANCO);
+  gfx->drawFastVLine(120, 100, 10, COLOR_BLANCO);
+  gfx->drawFastVLine(120, 130, 10, COLOR_BLANCO);
+}
+
+int indiceColor(const char *nombre)
+{
+  for (uint8_t i = 0; i < TOTAL_COLORES; i++) {
+    if (strcmp(nombre, NOMBRES_COLORES[i]) == 0) return i;
+  }
+  return -1;
+}
+
+void guardarArchivo()
+{
+  if (!almacenamientoOK) return;
+  File f = LittleFS.open("/colores.txt", "w");
+  if (!f) {
+    Serial.println("ERROR al abrir /colores.txt para escribir.");
+    return;
+  }
+  for (uint8_t i = 0; i < TOTAL_COLORES; i++) {
+    f.print(NOMBRES_COLORES[i]);
+    f.print(",");
+    f.println(conteosColores[i]);
+  }
+  f.close();
+}
+
+void cargarArchivo()
+{
+  for (uint8_t i = 0; i < TOTAL_COLORES; i++) conteosColores[i] = 0;
+  if (!almacenamientoOK) return;
+
+  File f = LittleFS.open("/colores.txt", "r");
+  if (!f) return;
+
+  while (f.available()) {
+    String linea = f.readStringUntil('\n');
+    linea.trim();
+    int coma = linea.indexOf(',');
+    if (coma <= 0) continue;
+    String nombre = linea.substring(0, coma);
+    uint32_t cantidad = (uint32_t)linea.substring(coma + 1).toInt();
+    int idx = indiceColor(nombre.c_str());
+    if (idx >= 0) conteosColores[idx] = cantidad;
+  }
+  f.close();
+
+  totalCapturas = 0;
+  for (uint8_t i = 0; i < TOTAL_COLORES; i++) totalCapturas += conteosColores[i];
+}
+
+void dibujarInicio()
+{
+  gfx->fillScreen(COLOR_NEGRO);
+
+  uint8_t k = 0;
+  k = textoMulticolor("Cazador", 78, 3, k);
+  textoMulticolor("de colores", 108, 3, k);
+
+  textoCentrado("by 404", 148, 2, COLOR_BLANCO);
+}
+
+void dibujarOpcionMenu(int yArriba, const char *texto)
+{
+  const int alto = 50;
+  int ancho = min(170, anchoDisponible(yArriba, yArriba + alto));
+
+  gfx->drawRoundRect(CENTRO_X - ancho / 2, yArriba, ancho, alto, 8, COLOR_BLANCO);
+  textoCentrado(texto, yArriba + (alto - 16) / 2, 2, COLOR_BLANCO);
+}
+
+void dibujarMenu()
+{
+  gfx->fillScreen(COLOR_NEGRO);
+  textoCentrado("MENU", 38, 2, COLOR_CYAN);
+  dibujarOpcionMenu(70, "A_JUEGO");
+  dibujarOpcionMenu(134, "B_ARCHIVO");
+}
+
+void irAlMenu()
+{
+  pantallaActual = PANTALLA_MENU;
+  dibujarMenu();
+}
+
+// Submenu de modos: A (boton JUEGO) = captura, B (boton ARCHIVO) = adivina
+void entrarAModos()
+{
+  pantallaActual = PANTALLA_MODOS;
+  gfx->fillScreen(COLOR_NEGRO);
+  textoCentrado("JUEGO", 38, 2, COLOR_CYAN);
+  dibujarOpcionMenu(70, "A_CAPTURA");
+  dibujarOpcionMenu(134, "B_ADIVINA");
+  textoCentrado("CAPTURA = VOLVER", 196, 1, COLOR_CYAN);
+}
+
+// Instruccion breve del modo elegido
+void mostrarInstruccion()
+{
+  pantallaActual = PANTALLA_INSTRUCCION;
+  gfx->fillScreen(COLOR_NEGRO);
+
+  if (modoJuego == MODO_ADIVINA) {
+    textoCentrado("ADIVINA", 26, 2, COLOR_CYAN);
+    textoLargo("Lee la adivinanza, busca ese color y pulsa CAPTURA. Con B la lees de nuevo.",
+               52, 194, COLOR_BLANCO);
+  } else {
+    textoCentrado("CAPTURA", 26, 2, COLOR_CYAN);
+    textoLargo("Apunta el sensor a un objeto y pulsa CAPTURA para guardar su color.",
+               52, 194, COLOR_BLANCO);
+  }
+  textoCentrado("PULSA PARA EMPEZAR", 200, 1, COLOR_CYAN);
+}
+
+// Elige una adivinanza al azar, distinta de la anterior
+void elegirAdivinanza()
+{
+  uint8_t nueva;
+  do {
+    nueva = (uint8_t)(esp_random() % TOTAL_ADIVINANZAS);
+  } while (TOTAL_ADIVINANZAS > 1 && nueva == adivinanzaActual);
+
+  adivinanzaActual = nueva;
+  adivinanzaColor = indiceColor(ADIVINANZAS[nueva].color);
+}
+
+void dibujarAdivinanza()
+{
+  pantallaActual = PANTALLA_ADIVINANZA;
+  gfx->fillScreen(COLOR_NEGRO);
+  textoCentrado("ADIVINA", 26, 2, COLOR_CYAN);
+  textoLargo(ADIVINANZAS[adivinanzaActual].texto, 52, 196, COLOR_BLANCO);
+  textoCentrado("PULSA PARA BUSCAR", 204, 1, COLOR_CYAN);
+}
+
+// Arma la lista con los colores que tienen al menos una captura
+void armarListaArchivo()
+{
+  totalListaArchivo = 0;
+  for (uint8_t i = 0; i < TOTAL_COLORES; i++) {
+    if (conteosColores[i] > 0) listaArchivo[totalListaArchivo++] = i;
+  }
+  seleccionArchivo = 0;
+}
+
+// Color con el que se escribe cada nombre cuando su fila esta activa (fondo blanco).
+// Mismo orden que NOMBRES_COLORES. Son tonos algo mas profundos que los de la
+// deteccion para que se lean bien sobre blanco; BLANCO usa negro porque blanco
+// sobre blanco no se veria.
+static_assert(TOTAL_COLORES == 11, "Actualizar colorDeFilaActiva() si cambia NOMBRES_COLORES");
+uint16_t colorDeFilaActiva(uint8_t idx)
+{
+  const uint16_t tonos[TOTAL_COLORES] = {
+    gfx->color565(  0,   0,   0),   // NEGRO
+    gfx->color565(120, 120, 120),   // GRIS
+    gfx->color565(  0,   0,   0),   // BLANCO (negro: sobre blanco no se veria)
+    gfx->color565(230,   0,   0),   // ROJO
+    gfx->color565(255,  70, 160),   // ROSADO
+    gfx->color565(255, 115,   0),   // NARANJA
+    gfx->color565(225, 175,   0),   // AMARILLO
+    gfx->color565(  0, 165,   0),   // VERDE
+    gfx->color565(  0, 165, 185),   // TURQUESA
+    gfx->color565(  0,  60, 230),   // AZUL
+    gfx->color565(130,   0, 200)    // MORADO
+  };
+  return tonos[idx];
+}
+
+void dibujarFilaArchivo(uint8_t fila, uint8_t posicionLista, bool seleccionada)
+{
+  uint8_t idx = listaArchivo[posicionLista];
+  int y = ARCH_Y0 + fila * ARCH_PASO;
+  int ancho = min(ARCH_ANCHO, anchoDisponible(y, y + ARCH_ALTO));
+  int x = CENTRO_X - ancho / 2;
+
+  // Fila activa: fondo blanco y letras del color correspondiente
+  uint16_t colorTexto = seleccionada ? colorDeFilaActiva(idx) : COLOR_BLANCO;
+  if (seleccionada) gfx->fillRoundRect(x, y, ancho, ARCH_ALTO, 8, COLOR_BLANCO);
+  else              gfx->drawRoundRect(x, y, ancho, ARCH_ALTO, 8, COLOR_GRIS);
+
+  const char *nombre = NOMBRES_COLORES[idx];
+  char cuenta[12];
+  snprintf(cuenta, sizeof(cuenta), "%lu", (unsigned long)conteosColores[idx]);
+
+  // 36 px = 14 de margen interno a cada lado + 8 de separacion entre nombre y numero
+  uint8_t tam = 2;
+  while (tam > 1 && (int)((strlen(nombre) + strlen(cuenta)) * 6 * tam) + 36 > ancho) tam--;
+
+  int yTexto = y + (ARCH_ALTO - 8 * tam) / 2;
+  int anchoCuenta = (int)(strlen(cuenta) * 6 * tam) - tam;
+
+  gfx->setTextSize(tam);
+  gfx->setTextColor(colorTexto);
+  gfx->setCursor(x + 14, yTexto);
+  gfx->print(nombre);
+  gfx->setCursor(x + ancho - 14 - anchoCuenta, yTexto);
+  gfx->print(cuenta);
+}
+
+void dibujarArchivo()
+{
+  gfx->fillScreen(COLOR_NEGRO);
+  textoCentrado("ARCHIVO", 28, 2, COLOR_CYAN);
+
+  if (totalListaArchivo == 0) {
+    textoCentrado("SIN CAPTURAS", 112, 2, COLOR_BLANCO);
+    return;
+  }
+
+  // Ventana de 3 filas: la seleccion baja hasta la ultima fila y luego la lista se desplaza
+  uint8_t inicio = 0;
+  if (seleccionArchivo >= FILAS_ARCHIVO) inicio = seleccionArchivo - (FILAS_ARCHIVO - 1);
+
+  for (uint8_t f = 0; f < FILAS_ARCHIVO; f++) {
+    uint8_t pos = inicio + f;
+    if (pos >= totalListaArchivo) break;
+    dibujarFilaArchivo(f, pos, pos == seleccionArchivo);
+  }
+}
+
+void entrarAlArchivo()
+{
+  pantallaActual = PANTALLA_ARCHIVO;
+  armarListaArchivo();
+  dibujarArchivo();
+}
+
+// Cada pulsacion de ARCHIVO baja un color; despues del ultimo vuelve al primero
+void avanzarArchivo()
+{
+  if (totalListaArchivo == 0) return;
+  seleccionArchivo = (seleccionArchivo + 1) % totalListaArchivo;
+  dibujarArchivo();
+}
+
+void entrarAlJuego()
+{
+  pantallaActual = PANTALLA_JUEGO;
+  gfx->fillScreen(COLOR_NEGRO);
+  if (sensorOK) {
+    mostrarResultadoColor(muestraActual, colorActual);
+  } else {
+    mostrarResultadoColor(COLOR_NEGRO, "SIN SENSOR");
+  }
+}
+
+void actualizarColor()
+{
+  if (!sensorOK) return;
+
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+
+  if (c == 0) {
+    colorValido = false;
+    strcpy(colorActual, "SIN LUZ");
+    muestraActual = COLOR_NEGRO;
+    mostrarResultadoColor(muestraActual, colorActual);
+    return;
+  }
+
+  int rojo  = constrain((r * 255L) / c, 0, 255);
+  int verde = constrain((g * 255L) / c, 0, 255);
+  int azul  = constrain((b * 255L) / c, 0, 255);
+
+  const char *nombre = detectarColor(rojo, verde, azul);
+  strncpy(colorActual, nombre, sizeof(colorActual) - 1);
+  colorActual[sizeof(colorActual) - 1] = '\0';
+  muestraActual = gfx->color565(rojo, verde, azul);
+  colorValido = (indiceColor(colorActual) >= 0);
+
+  mostrarResultadoColor(muestraActual, colorActual);
+}
+
+void capturarColor()
+{
+  if (!sensorOK || !colorValido) {
+    gfx->fillRect(0, 180, 240, 60, COLOR_NEGRO);
+    textoCentrado("SIN COLOR", 186, 2, COLOR_ROJO);
+    delay(350);
+    mostrarResultadoColor(muestraActual, colorActual);
+    return;
+  }
+
+  int idx = indiceColor(colorActual);
+  if (idx < 0) return;
+
+  // Modo ADIVINA: solo cuenta si el color capturado es el de la adivinanza
+  if (modoJuego == MODO_ADIVINA && idx != adivinanzaColor) {
+    gfx->fillRect(0, 180, 240, 60, COLOR_NEGRO);
+    textoCentrado("NO ES ESE", 186, 2, COLOR_ROJO);
+    textoCentrado("SIGUE BUSCANDO", 208, 1, COLOR_BLANCO);
+    delay(800);
+    mostrarResultadoColor(muestraActual, colorActual);
+    return;
+  }
+
+  conteosColores[idx]++;
+  totalCapturas++;
+  guardarArchivo();
+
+  if (modoJuego == MODO_ADIVINA) {
+    gfx->fillRect(0, 180, 240, 60, COLOR_NEGRO);
+    textoCentrado("CORRECTO!", 186, 2, COLOR_VERDE);
+    textoCentrado(colorActual, 208, 1, COLOR_BLANCO);
+    delay(1000);
+    elegirAdivinanza();      // siguiente adivinanza
+    dibujarAdivinanza();
+    return;
+  }
+
+  mostrarResultadoColor(muestraActual, colorActual);
+}
+
+bool pulsacionNueva(uint8_t indice)
+{
+  EstadoBoton &b = botones[indice];
+  bool lectura = digitalRead(b.pin);
+
+  if (lectura != b.lecturaAnterior) {
+    b.lecturaAnterior = lectura;
+    b.cambio = millis();
+  }
+
+  if (millis() - b.cambio >= ANTIRREBOTE_MS && lectura != b.estadoEstable) {
+    b.estadoEstable = lectura;
+    if (b.estadoEstable == LOW) return true;
+  }
+  return false;
+}
+
+void procesarBotones()
+{
+  // Se leen los tres siempre, para mantener el antirrebote de cada uno
+  bool juego   = pulsacionNueva(0);   // boton JUEGO   = opciones A
+  bool archivo = pulsacionNueva(1);   // boton ARCHIVO = opciones B
+  bool captura = pulsacionNueva(2);
+  bool cualquiera = juego || archivo || captura;
+
+  switch (pantallaActual) {
+    case PANTALLA_INICIO:
+      if (juego || archivo) irAlMenu();
+      break;
+
+    case PANTALLA_MENU:
+      if (juego) entrarAModos();             // A_JUEGO
+      else if (archivo) entrarAlArchivo();   // B_ARCHIVO
+      break;
+
+    case PANTALLA_MODOS:
+      if (juego) {                           // A_CAPTURA
+        modoJuego = MODO_CAPTURA;
+        mostrarInstruccion();
+      } else if (archivo) {                  // B_ADIVINA
+        modoJuego = MODO_ADIVINA;
+        mostrarInstruccion();
+      } else if (captura) {
+        irAlMenu();
+      }
+      break;
+
+    case PANTALLA_INSTRUCCION:
+      if (cualquiera) {
+        if (modoJuego == MODO_ADIVINA) {
+          elegirAdivinanza();
+          dibujarAdivinanza();
+        } else {
+          entrarAlJuego();
+        }
+      }
+      break;
+
+    case PANTALLA_ADIVINANZA:
+      if (cualquiera) entrarAlJuego();
+      break;
+
+    case PANTALLA_JUEGO:
+      if (juego) {
+        irAlMenu();
+      } else if (archivo) {
+        if (modoJuego == MODO_ADIVINA) dibujarAdivinanza();   // releer la adivinanza
+        else irAlMenu();
+      } else if (captura) {
+        capturarColor();
+      }
+      break;
+
+    case PANTALLA_ARCHIVO:
+      if (juego) irAlMenu();
+      else if (archivo) avanzarArchivo();
+      break;
+  }
+}
+
+// Se inicia DESPUES de la camara: la camara configura sus pines por software
+// y el sensor usa el I2C por hardware en otros pines.
+void sensorColorBegin()
+{
+  Wire.begin(SENSOR_SDA, SENSOR_SCL);
+   Wire.setClock(100000);
+
+
+if (tcs.begin(0x29, &Wire))
+  {
+    sensorOK = true;
+    Serial.println("TCS34725 OK.");
+  }
+  else
+  {
+    sensorOK = false;
+    Serial.println("ERROR: TCS34725 NO detectado.");
+    // El aviso "SIN SENSOR" se muestra al entrar al modo juego (entrarAlJuego).
+  }
+}
+
+// --------------------------------------------------
+// SETUP
+// --------------------------------------------------
+
+void testCameraSCCB()
+{
+  Serial.println("Probando comunicacion SCCB...");
+
+  cameraI2C.start();
+
+  bool ack = cameraI2C.writeByte(0x42);
+
+  cameraI2C.stop();
+
+  if (ack)
+  {
+    Serial.println("OV7670 responde por SCCB");
+  }
+  else
+  {
+    Serial.println("ERROR: OV7670 no responde por SCCB");
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("CAZA COLORES - OV7670 + GC9A01 + TCS34725");
+  Serial.println("ESP32 DevKit V1 / Core 3.3.12");
+
+  Serial.println("Iniciando pantalla...");
+  if (!gfx->begin()) {
+    Serial.println("ERROR: no se pudo iniciar GC9A01.");
+    while (true) delay(1000);
+  }
+  dibujarInicio();   // pantalla de inicio: se queda hasta pulsar JUEGO o ARCHIVO
+
+  if (!cameraBegin()) {
+    gfx->fillScreen(COLOR_ROJO);
+    textoCentrado("ERROR CAM", 112, 2, COLOR_BLANCO);
+    while (true) delay(1000);
+  }
+
+  sensorColorBegin();
+
+  almacenamientoOK = LittleFS.begin(false);
+  if (almacenamientoOK) {
+    Serial.println("LittleFS OK.");
+    cargarArchivo();
+  } else {
+    Serial.println("ERROR LittleFS: no se pudo montar. No se formateo la memoria.");
+  }
+
+  // GPIO3 se utiliza como boton, por eso se libera UART0 despues del arranque.
+  Serial.println("Sistema listo. No mantener pulsados botones al encender.");
+  Serial.end();
+
+  for (uint8_t i = 0; i < 3; i++) {
+    pinMode(botones[i].pin, INPUT_PULLUP);
+    botones[i].lecturaAnterior = digitalRead(botones[i].pin);
+    botones[i].estadoEstable = botones[i].lecturaAnterior;
+    botones[i].cambio = millis();
+  }
+
+  // La pantalla de inicio ya esta dibujada desde el arranque; no se redibuja.
+  pantallaActual = PANTALLA_INICIO;
+}
+
+// --------------------------------------------------
+// LOOP PRINCIPAL
+// --------------------------------------------------
+
+void loop()
+{
+  procesarBotones();
+
+  if (pantallaActual != PANTALLA_JUEGO) {
+    delay(5);
+    return;
+  }
+
+  if (sensorOK && millis() - ultimaLectura >= INTERVALO_COLOR) {
+    ultimaLectura = millis();
+    actualizarColor();
+  }
+
+  if (!cameraCaptureFrame()) {
+    delay(10);
+    return;
+  }
+
+  gfx->draw16bitRGBBitmap(
+    40,
+    60,
+    (uint16_t *)cameraFrame,
+    CAM_WIDTH,
+    CAM_HEIGHT
+  );
+
+  dibujarMira();
+}
