@@ -1,0 +1,991 @@
+**Descripción:**
+
+
+**Resultados:**
+
+
+**Código:**
+
+/*
+  OV7670 sin FIFO + GC9A01 240x240
+  ESP32 DevKit V1 - Arduino ESP32 core 3.3.12
+
+  Captura basada en bitluni/ESP32CameraI2S.
+  Sin WiFi, sin servidor web y sin almacenamiento.
+
+  IMPORTANTE:
+  - Este código está dirigido al ESP32 clásico.
+  - Requiere la librería GFX Library for Arduino.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+#include <Arduino_GFX_Library.h>
+#include <driver/gpio.h>
+#include <driver/ledc.h>
+#include <driver/periph_ctrl.h>
+#include <esp_intr_alloc.h>
+#include <esp_heap_caps.h>
+#include <rom/lldesc.h>
+#include <soc/soc.h>
+#include <soc/gpio_sig_map.h>
+#include <soc/i2s_reg.h>
+#include <soc/i2s_struct.h>
+#include "soc/gpio_struct.h"
+
+// --------------------------------------------------
+// PINES DE LA PANTALLA GC9A01
+// --------------------------------------------------
+
+#define TFT_SCLK 18
+#define TFT_MOSI 23
+#define TFT_CS    5
+#define TFT_DC   16
+#define TFT_RST  17
+
+Arduino_DataBus *tftBus =
+  new Arduino_HWSPI(TFT_DC, TFT_CS, TFT_SCLK, TFT_MOSI);
+
+Arduino_GFX *gfx =
+  new Arduino_GC9A01(tftBus, TFT_RST, 0, true);
+
+// --------------------------------------------------
+// PINES DE LA OV7670
+// --------------------------------------------------
+
+#define CAM_SIOD  26
+#define CAM_SIOC  27
+
+#define CAM_VSYNC 25
+#define CAM_HREF  33
+#define CAM_XCLK  14
+#define CAM_PCLK  32
+
+#define CAM_D0    36
+#define CAM_D1    39
+#define CAM_D2    35
+#define CAM_D3    34
+#define CAM_D4    19
+#define CAM_D5    22
+#define CAM_D6    21
+#define CAM_D7    13
+
+// --------------------------------------------------
+// SENSOR DE COLOR TCS34725
+// Comparte el bus I2C con la OV7670.
+// La cámara usa SCCB durante el arranque; después el
+// bus queda disponible para las lecturas del TCS34725.
+// --------------------------------------------------
+#define SENSOR_SDA CAM_SIOD
+#define SENSOR_SCL CAM_SIOC
+
+Adafruit_TCS34725 tcs(
+  TCS34725_INTEGRATIONTIME_50MS,
+  TCS34725_GAIN_4X
+);
+
+bool sensorColorOK = false;
+unsigned long ultimaLecturaColor = 0;
+const unsigned long INTERVALO_COLOR = 5000;
+char colorDetectado[20] = "INICIANDO";
+
+// --------------------------------------------------
+// RESOLUCIÓN DE CAPTURA
+// --------------------------------------------------
+
+#define CAM_WIDTH  160
+#define CAM_HEIGHT 120
+
+// --------------------------------------------------
+// RELOJ XCLK
+// --------------------------------------------------
+
+bool clockEnable(int pin, uint32_t hz)
+{
+  if (!ledcAttach(pin, hz, 1))
+    return false;
+
+  return ledcWrite(pin, 1);
+}
+
+// --------------------------------------------------
+// I2C POR SOFTWARE PARA OV7670
+// --------------------------------------------------
+
+class CameraI2C
+{
+public:
+  int sda;
+  int scl;
+
+  CameraI2C(int dataPin, int clockPin)
+  {
+    sda = dataPin;
+    scl = clockPin;
+
+    pinMode(sda, INPUT_PULLUP);
+    pinMode(scl, INPUT_PULLUP);
+  }
+
+  void delayBit()
+  {
+    delayMicroseconds(2);
+  }
+
+  void sdaLow()
+  {
+    pinMode(sda, OUTPUT);
+    digitalWrite(sda, LOW);
+  }
+
+  void sdaHigh()
+  {
+    pinMode(sda, INPUT_PULLUP);
+  }
+
+  void sclLow()
+  {
+    pinMode(scl, OUTPUT);
+    digitalWrite(scl, LOW);
+  }
+
+  void sclHigh()
+  {
+    pinMode(scl, INPUT_PULLUP);
+  }
+
+  void start()
+  {
+    sdaHigh();
+    sclHigh();
+    delayBit();
+    sdaLow();
+    delayBit();
+    sclLow();
+  }
+
+  void stop()
+  {
+    sdaLow();
+    sclHigh();
+    delayBit();
+    sdaHigh();
+    delayBit();
+  }
+
+  bool writeByte(uint8_t value)
+  {
+    for (int i = 0; i < 8; i++)
+    {
+      if (value & 0x80)
+        sdaHigh();
+      else
+        sdaLow();
+
+      value <<= 1;
+
+      delayBit();
+      sclHigh();
+      delayBit();
+      sclLow();
+    }
+
+    sdaHigh();
+    delayBit();
+    sclHigh();
+    delayBit();
+
+    bool ack = (digitalRead(sda) == LOW);
+
+    sclLow();
+    return ack;
+  }
+
+  bool writeRegister(uint8_t address, uint8_t reg, uint8_t value)
+  {
+    start();
+
+    bool ok = writeByte(address);
+    if (ok) ok = writeByte(reg);
+    if (ok) ok = writeByte(value);
+
+    stop();
+    return ok;
+  }
+};
+
+CameraI2C cameraI2C(CAM_SIOD, CAM_SIOC);
+
+// --------------------------------------------------
+// DMA
+// --------------------------------------------------
+
+struct CameraDMABuffer
+{
+  lldesc_t descriptor;
+  uint8_t *buffer;
+
+  CameraDMABuffer(int bytes)
+  {
+    buffer = (uint8_t *)heap_caps_malloc(
+      bytes,
+      MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL
+    );
+
+    memset(&descriptor, 0, sizeof(descriptor));
+
+    descriptor.length = bytes;
+    descriptor.size = bytes;
+    descriptor.owner = 1;
+    descriptor.sosf = 1;
+    descriptor.buf = buffer;
+    descriptor.offset = 0;
+    descriptor.eof = 1;
+    descriptor.qe.stqe_next = nullptr;
+  }
+
+  void next(CameraDMABuffer *other)
+  {
+    descriptor.qe.stqe_next = &other->descriptor;
+  }
+};
+
+CameraDMABuffer *dmaBuffers[2] = {nullptr, nullptr};
+
+volatile int dmaActive = 0;
+volatile int blocksReceived = 0;
+
+uint8_t *cameraFrame = nullptr;
+
+volatile int framePointer = 0;
+int frameBytes = CAM_WIDTH * CAM_HEIGHT * 2;
+
+volatile bool stopRequested = false;
+volatile bool frameComplete = false;
+
+intr_handle_t i2sInterruptHandle = nullptr;
+intr_handle_t vsyncInterruptHandle = nullptr;
+
+// --------------------------------------------------
+// REINICIO DE I2S
+// --------------------------------------------------
+
+void i2sReset()
+{
+  const uint32_t lcFlags =
+    I2S_IN_RST_M |
+    I2S_AHBM_RST_M |
+    I2S_AHBM_FIFO_RST_M;
+
+  I2S0.lc_conf.val |= lcFlags;
+  I2S0.lc_conf.val &= ~lcFlags;
+
+  const uint32_t confFlags =
+    I2S_RX_RESET_M |
+    I2S_RX_FIFO_RESET_M |
+    I2S_TX_RESET_M |
+    I2S_TX_FIFO_RESET_M;
+
+  I2S0.conf.val |= confFlags;
+  I2S0.conf.val &= ~confFlags;
+
+  while (I2S0.state.rx_fifo_reset_back) {}
+}
+
+// --------------------------------------------------
+// INTERRUPCIÓN I2S
+// --------------------------------------------------
+
+void IRAM_ATTR cameraI2SInterrupt(void *arg)
+{
+  I2S0.int_clr.val = I2S0.int_raw.val;
+
+  blocksReceived++;
+
+  uint8_t *buf = dmaBuffers[dmaActive]->buffer;
+
+  dmaActive = (dmaActive + 1) % 2;
+
+  if (framePointer < frameBytes)
+  {
+    for (int i = 0; i < CAM_WIDTH * 4; i += 4)
+    {
+      cameraFrame[framePointer++] = buf[i + 2];
+      cameraFrame[framePointer++] = buf[i];
+    }
+  }
+
+  if (blocksReceived >= CAM_HEIGHT)
+  {
+    framePointer = 0;
+    blocksReceived = 0;
+
+    frameComplete = true;
+
+    if (stopRequested)
+    {
+      esp_intr_disable(i2sInterruptHandle);
+      esp_intr_disable(vsyncInterruptHandle);
+
+      I2S0.conf.rx_start = 0;
+      stopRequested = false;
+    }
+  }
+}
+
+// --------------------------------------------------
+// INTERRUPCIÓN VSYNC
+// --------------------------------------------------
+
+void IRAM_ATTR cameraVSyncInterrupt(void *arg)
+{
+  GPIO.status_w1tc = (1U << CAM_VSYNC);
+}
+
+// --------------------------------------------------
+// CONFIGURACIÓN DE ENTRADAS I2S
+// --------------------------------------------------
+
+bool cameraI2SInit()
+{
+  int pins[] =
+  {
+    CAM_VSYNC,
+    CAM_HREF,
+    CAM_PCLK,
+    CAM_D0,
+    CAM_D1,
+    CAM_D2,
+    CAM_D3,
+    CAM_D4,
+    CAM_D5,
+    CAM_D6,
+    CAM_D7
+  };
+
+  gpio_config_t conf = {};
+  conf.mode = GPIO_MODE_INPUT;
+  conf.pull_up_en = GPIO_PULLUP_DISABLE;
+  conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  conf.intr_type = GPIO_INTR_DISABLE;
+
+  for (int i = 0; i < 11; i++)
+  {
+    conf.pin_bit_mask = 1ULL << pins[i];
+
+    if (gpio_config(&conf) != ESP_OK)
+      return false;
+  }
+
+  gpio_matrix_in(CAM_D0, I2S0I_DATA_IN0_IDX, false);
+  gpio_matrix_in(CAM_D1, I2S0I_DATA_IN1_IDX, false);
+  gpio_matrix_in(CAM_D2, I2S0I_DATA_IN2_IDX, false);
+  gpio_matrix_in(CAM_D3, I2S0I_DATA_IN3_IDX, false);
+  gpio_matrix_in(CAM_D4, I2S0I_DATA_IN4_IDX, false);
+  gpio_matrix_in(CAM_D5, I2S0I_DATA_IN5_IDX, false);
+  gpio_matrix_in(CAM_D6, I2S0I_DATA_IN6_IDX, false);
+  gpio_matrix_in(CAM_D7, I2S0I_DATA_IN7_IDX, false);
+
+  gpio_matrix_in(0x30, I2S0I_DATA_IN8_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN9_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN10_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN11_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN12_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN13_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN14_IDX, false);
+  gpio_matrix_in(0x30, I2S0I_DATA_IN15_IDX, false);
+
+  gpio_matrix_in(CAM_VSYNC, I2S0I_V_SYNC_IDX, true);
+  gpio_matrix_in(0x38, I2S0I_H_SYNC_IDX, false);
+  gpio_matrix_in(CAM_HREF, I2S0I_H_ENABLE_IDX, false);
+  gpio_matrix_in(CAM_PCLK, I2S0I_WS_IN_IDX, false);
+
+  periph_module_enable(PERIPH_I2S0_MODULE);
+
+  i2sReset();
+
+  I2S0.conf.rx_slave_mod = 1;
+  I2S0.conf2.lcd_en = 1;
+  I2S0.conf2.camera_en = 1;
+
+  I2S0.clkm_conf.clkm_div_a = 1;
+  I2S0.clkm_conf.clkm_div_b = 0;
+  I2S0.clkm_conf.clkm_div_num = 2;
+
+  I2S0.fifo_conf.dscr_en = 1;
+I2S0.fifo_conf.rx_fifo_mod = 1;
+
+  I2S0.fifo_conf.rx_fifo_mod_force_en = 1;
+  I2S0.conf_chan.rx_chan_mod = 1;
+
+  I2S0.sample_rate_conf.rx_bits_mod = 0;
+  I2S0.conf.rx_right_first = 0;
+  I2S0.conf.rx_msb_right = 0;
+  I2S0.conf.rx_msb_shift = 0;
+  I2S0.conf.rx_mono = 0;
+  I2S0.conf.rx_short_sync = 0;
+  I2S0.timing.val = 0;
+
+  return true;
+}
+
+// --------------------------------------------------
+// INICIALIZACIÓN DMA
+// --------------------------------------------------
+
+bool cameraDMAInit()
+{
+  const int dmaBytes = CAM_WIDTH * 4;
+
+  for (int i = 0; i < 2; i++)
+  {
+    dmaBuffers[i] = new CameraDMABuffer(dmaBytes);
+
+    if (!dmaBuffers[i]->buffer)
+      return false;
+  }
+
+  dmaBuffers[0]->next(dmaBuffers[1]);
+  dmaBuffers[1]->next(dmaBuffers[0]);
+
+  return true;
+}
+
+// --------------------------------------------------
+// ARRANQUE DE CAPTURA
+// --------------------------------------------------
+
+bool cameraCaptureStart()
+{
+  uint32_t startTime = millis();
+
+  Serial.print("VSYNC inicial: ");
+  Serial.println(digitalRead(CAM_VSYNC));
+
+  while (digitalRead(CAM_VSYNC) == LOW)
+  {
+    if (millis() - startTime > 1000)
+    {
+      Serial.println("ERROR: VSYNC nunca subio a HIGH");
+      return false;
+    }
+  }
+
+  Serial.println("VSYNC paso a HIGH");
+
+  while (digitalRead(CAM_VSYNC) == HIGH)
+  {
+    if (millis() - startTime > 1500)
+    {
+      Serial.println("ERROR: VSYNC nunca volvio a LOW");
+      return false;
+    }
+  }
+
+  Serial.println("VSYNC paso a LOW");
+
+  esp_intr_disable(i2sInterruptHandle);
+
+  i2sReset();
+
+  blocksReceived = 0;
+  dmaActive = 0;
+  framePointer = 0;
+  frameComplete = false;
+  stopRequested = true;
+
+  I2S0.rx_eof_num = dmaBuffers[0]->descriptor.length / 4;
+
+  I2S0.in_link.addr =
+    (uint32_t)&dmaBuffers[0]->descriptor;
+
+  I2S0.in_link.start = 1;
+
+  I2S0.int_clr.val = I2S0.int_raw.val;
+  I2S0.int_ena.val = 0;
+  I2S0.int_ena.in_done = 1;
+
+  esp_intr_enable(i2sInterruptHandle);
+  esp_intr_enable(vsyncInterruptHandle);
+
+  I2S0.conf.rx_start = 1;
+
+  Serial.println("I2S iniciado; esperando captura...");
+  return true;
+}
+
+// --------------------------------------------------
+// CAPTURA DE UN FOTOGRAMA
+// --------------------------------------------------
+
+bool cameraCaptureFrame()
+{
+  if (!cameraCaptureStart())
+    return false;
+
+  uint32_t startTime = millis();
+
+  while (stopRequested)
+  {
+    if (millis() - startTime > 1500)
+    {
+      Serial.println("ERROR: tiempo agotado esperando captura");
+Serial.print("Bloques recibidos: ");
+Serial.println(blocksReceived);
+Serial.print("Bytes recibidos: ");
+Serial.println(framePointer);
+Serial.print("VSYNC actual: ");
+Serial.println(digitalRead(CAM_VSYNC));
+Serial.print("I2S int_raw: ");
+Serial.println(I2S0.int_raw.val, HEX);
+      esp_intr_disable(i2sInterruptHandle);
+      esp_intr_disable(vsyncInterruptHandle);
+
+      I2S0.conf.rx_start = 0;
+      stopRequested = false;
+
+      return false;
+    }
+
+    delay(1);
+  }
+
+  return frameComplete;
+}
+
+// --------------------------------------------------
+// CONFIGURACIÓN OV7670
+// --------------------------------------------------
+
+bool cameraConfigure()
+{
+  if (!clockEnable(CAM_XCLK, 20000000))
+    return false;
+  delay(200);
+
+Serial.println("Probando SCCB con XCLK activo...");
+
+cameraI2C.start();
+bool ack = cameraI2C.writeByte(0x42);
+cameraI2C.stop();
+
+if (ack)
+{
+  Serial.println("OK: OV7670 responde por SCCB");
+}
+else
+{
+  Serial.println("ERROR: sin respuesta SCCB con XCLK activo");
+  return false;
+}
+
+  pinMode(CAM_VSYNC, INPUT);
+
+  uint32_t startTime = millis();
+
+  while (!digitalRead(CAM_VSYNC))
+  {
+    if (millis() - startTime > 2000)
+      return false;
+  }
+
+  while (digitalRead(CAM_VSYNC))
+  {
+    if (millis() - startTime > 2500)
+      return false;
+  }
+
+  // Reinicio de registros de cámara
+  Serial.println("Enviando reinicio a OV7670...");
+   Serial.println("Resultado del reinicio SCCB");
+  Serial.println("Probando escritura del registro COM7...");
+
+cameraI2C.start();
+
+bool ack1 = cameraI2C.writeByte(0x42);
+cameraI2C.delayBit();
+
+bool ack2 = cameraI2C.writeByte(0x12);
+cameraI2C.delayBit();
+
+bool ack3 = cameraI2C.writeByte(0x80);
+
+cameraI2C.stop();
+
+Serial.print("Respuesta direccion 0x42: ");
+Serial.println(ack1 ? "OK" : "FALLO");
+
+Serial.print("Respuesta registro 0x12: ");
+Serial.println(ack2 ? "OK" : "FALLO");
+
+Serial.print("Respuesta dato 0x80: ");
+Serial.println(ack3 ? "OK" : "FALLO");
+
+if (!ack1 || !ack2 || !ack3)
+{
+  Serial.println("ERROR: fallo en escritura SCCB");
+  return false;
+}
+
+Serial.println("Reinicio de registros enviado.");
+delay(100);
+
+ // Formato RGB
+cameraI2C.writeRegister(0x42, 0x12, 0x04);
+cameraI2C.writeRegister(0x42, 0x40, 0xD0);
+
+// Reloj y exposición
+cameraI2C.writeRegister(0x42, 0x11, 0x80);
+cameraI2C.writeRegister(0x42, 0x3B, 0x0A);
+
+// Escalado QQVGA 160x120
+cameraI2C.writeRegister(0x42, 0x0C, 0x04);
+cameraI2C.writeRegister(0x42, 0x3E, 0x1A);
+cameraI2C.writeRegister(0x42, 0x70, 0x3A);
+cameraI2C.writeRegister(0x42, 0x71, 0x35);
+cameraI2C.writeRegister(0x42, 0x72, 0x22);
+cameraI2C.writeRegister(0x42, 0x73, 0xF2);
+cameraI2C.writeRegister(0x42, 0xA2, 0x02);
+
+  // Ventana de imagen
+  cameraI2C.writeRegister(0x42, 0x17, 196 >> 3);
+  cameraI2C.writeRegister(0x42, 0x18, 52 >> 3);
+  cameraI2C.writeRegister(0x42, 0x32, ((52 & 7) << 3) | (196 & 7));
+
+  cameraI2C.writeRegister(0x42, 0x19, 8 >> 2);
+  cameraI2C.writeRegister(0x42, 0x1A, 488 >> 2);
+  cameraI2C.writeRegister(0x42, 0x03, ((488 & 3) << 2) | (8 & 3));
+
+  // Ajuste de color
+cameraI2C.writeRegister(0x42, 0xB0, 0x84);
+cameraI2C.writeRegister(0x42, 0x4F, 0x80);
+cameraI2C.writeRegister(0x42, 0x50, 0x80);
+cameraI2C.writeRegister(0x42, 0x51, 0x00);
+cameraI2C.writeRegister(0x42, 0x52, 0x22);
+cameraI2C.writeRegister(0x42, 0x53, 0x5E);
+cameraI2C.writeRegister(0x42, 0x54, 0x80);
+cameraI2C.writeRegister(0x42, 0x58, 0x9E);
+
+cameraI2C.writeRegister(0x42, 0x13, 0xE7);
+cameraI2C.writeRegister(0x42, 0x6F, 0x9F);
+
+  return true;
+}
+
+// --------------------------------------------------
+// INICIALIZACIÓN GENERAL DE CÁMARA
+// --------------------------------------------------
+
+bool cameraBegin()
+{
+  Serial.println("Iniciando reloj XCLK...");
+
+  if (!cameraConfigure())
+  {
+    Serial.println("ERROR: no se pudo iniciar la OV7670.");
+    return false;
+  }
+
+  Serial.println("Configurando memoria de imagen...");
+
+Serial.printf("RAM interna libre: %u bytes\n",
+  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+Serial.printf("Bloque contiguo mayor: %u bytes\n",
+  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cameraFrame = (uint8_t *)heap_caps_malloc(
+    frameBytes,
+    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+  );
+
+  if (!cameraFrame)
+  {
+    Serial.println("ERROR: no hay memoria para el fotograma.");
+    return false;
+  }
+
+  if (!cameraI2SInit())
+  {
+    Serial.println("ERROR: inicialización I2S.");
+    return false;
+  }
+
+  if (!cameraDMAInit())
+  {
+    Serial.println("ERROR: inicialización DMA.");
+    return false;
+  }
+
+  gpio_set_intr_type(
+    (gpio_num_t)CAM_VSYNC,
+    GPIO_INTR_POSEDGE
+  );
+
+  gpio_intr_enable((gpio_num_t)CAM_VSYNC);
+
+  if (gpio_isr_register(
+        &cameraVSyncInterrupt,
+        nullptr,
+        ESP_INTR_FLAG_INTRDISABLED | ESP_INTR_FLAG_IRAM,
+        &vsyncInterruptHandle) != ESP_OK)
+  {
+    Serial.println("ERROR: interrupción VSYNC.");
+    return false;
+  }
+
+  if (esp_intr_alloc(
+        ETS_I2S0_INTR_SOURCE,
+        ESP_INTR_FLAG_INTRDISABLED |
+        ESP_INTR_FLAG_LEVEL1 |
+        ESP_INTR_FLAG_IRAM,
+        &cameraI2SInterrupt,
+        nullptr,
+        &i2sInterruptHandle) != ESP_OK)
+  {
+    Serial.println("ERROR: interrupción I2S.");
+    return false;
+  }
+
+  Serial.println("Cámara preparada.");
+  return true;
+}
+
+// --------------------------------------------------
+// SETUP
+// --------------------------------------------------
+
+void testCameraSCCB()
+{
+  Serial.println("Probando comunicacion SCCB...");
+
+  cameraI2C.start();
+
+  bool ack = cameraI2C.writeByte(0x42);
+
+  cameraI2C.stop();
+
+  if (ack)
+  {
+    Serial.println("OV7670 responde por SCCB");
+  }
+  else
+  {
+    Serial.println("ERROR: OV7670 no responde por SCCB");
+  }
+}
+
+// --------------------------------------------------
+// CLASIFICACIÓN DEL COLOR (criterios del código original)
+// --------------------------------------------------
+
+const char *nombreColor(uint16_t rojo, uint16_t verde, uint16_t azul)
+{
+  if (rojo < 30 && verde < 30 && azul < 30)
+    return "NEGRO";
+
+  if (rojo > 200 && verde > 200 && azul > 200)
+    return "BLANCO";
+
+  if (rojo > 150 && verde > 130 && azul < 100)
+    return "AMARILLO";
+
+  if (rojo > 170 && verde > 70 && verde < 160 && azul < 80)
+    return "NARANJA";
+
+  if (rojo > verde * 1.4f && rojo > azul * 1.4f)
+    return "ROJO";
+
+  if (verde > rojo * 1.3f && verde > azul * 1.2f)
+    return "VERDE";
+
+  if (azul > rojo * 1.3f && azul > verde * 1.15f)
+    return "AZUL";
+
+  if (verde > rojo * 1.15f && azul > rojo * 1.15f)
+    return "CIAN";
+
+  if (rojo > verde * 1.15f && azul > verde * 1.15f)
+    return "MORADO";
+
+  return "COLOR";
+}
+
+// --------------------------------------------------
+// LECTURA Y PRESENTACIÓN DEL TCS34725
+// --------------------------------------------------
+
+void actualizarColor()
+{
+  uint16_t r = 0;
+  uint16_t g = 0;
+  uint16_t b = 0;
+  uint16_t c = 0;
+
+  tcs.getRawData(&r, &g, &b, &c);
+
+  Serial.println();
+  Serial.println("------------------------------");
+  Serial.print("R: "); Serial.println(r);
+  Serial.print("G: "); Serial.println(g);
+  Serial.print("B: "); Serial.println(b);
+  Serial.print("C: "); Serial.println(c);
+
+  if (c == 0)
+  {
+    strcpy(colorDetectado, "SIN LUZ");
+    Serial.println("Sin luz detectada.");
+  }
+  else
+  {
+    strncpy(colorDetectado, nombreColor(r, g, b), sizeof(colorDetectado) - 1);
+    colorDetectado[sizeof(colorDetectado) - 1] = '\0';
+    Serial.print("Color detectado: ");
+    Serial.println(colorDetectado);
+  }
+
+  // Zona inferior de la pantalla: no tapa el video de la cámara.
+  gfx->fillRect(0, 190, 240, 50, 0x0000);
+  gfx->setTextColor(0xFFFF);
+  gfx->setTextSize(1);
+  gfx->setCursor(8, 198);
+  gfx->print("COLOR: ");
+  gfx->print(colorDetectado);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("OV7670 + GC9A01");
+  Serial.println("ESP32 DevKit V1 / Core 3.3.12");
+
+  Serial.println("Iniciando pantalla...");
+
+  if (!gfx->begin())
+  {
+    Serial.println("ERROR: no se pudo iniciar GC9A01.");
+    while (true) delay(1000);
+  }
+
+  gfx->fillScreen(0x0000);
+  gfx->setTextColor(0xFFFF);
+  gfx->setCursor(45, 105);
+  gfx->setTextSize(2);
+  gfx->println("CAMERA");
+
+  Serial.println("Pantalla iniciada.");
+
+  if (!cameraBegin())
+  {
+    gfx->fillScreen(0xF800);
+    gfx->setCursor(35, 110);
+    gfx->setTextColor(0xFFFF);
+    gfx->println("ERROR CAM");
+    while (true) delay(1000);
+  }
+
+  gfx->fillScreen(0x0000);
+
+  // El bus 26/27 ya fue usado por SCCB al configurar la cámara.
+  // Ahora Wire lo utiliza para comunicarse con el TCS34725.
+  Wire.begin(SENSOR_SDA, SENSOR_SCL);
+  Wire.setClock(100000);
+  Serial.println("Buscando dispositivos I2C...");
+
+for (uint8_t address = 1; address < 127; address++)
+{
+  Wire.beginTransmission(address);
+  uint8_t error = Wire.endTransmission();
+
+  if (error == 0)
+  {
+    Serial.print("Dispositivo encontrado en 0x");
+    Serial.println(address, HEX);
+  }
+}
+
+Serial.println("Fin de busqueda I2C.");
+
+  if (tcs.begin())
+  {
+    sensorColorOK = true;
+    Serial.println("TCS34725 detectado correctamente.");
+    actualizarColor();
+    ultimaLecturaColor = millis();
+  }
+  else
+  {
+    sensorColorOK = false;
+    strcpy(colorDetectado, "NO DETECTADO");
+    Serial.println("ERROR: TCS34725 no detectado. La cámara seguirá funcionando.");
+    gfx->setTextColor(0xFFFF);
+    gfx->setTextSize(1);
+    gfx->setCursor(12, 205);
+    gfx->print("SENSOR NO DETECTADO");
+  }
+
+  Serial.println("Sistema listo.");
+}
+
+// --------------------------------------------------
+// ESPEJO HORIZONTAL DEL FOTOGRAMA
+// Intercambia los píxeles de cada fila, sin modificar
+// la captura original de la OV7670.
+// --------------------------------------------------
+void mirrorFrameHorizontal()
+{
+  if (cameraFrame == nullptr)
+    return;
+
+  uint16_t *pixels = (uint16_t *)cameraFrame;
+
+  for (int y = 0; y < CAM_HEIGHT; y++)
+  {
+    uint16_t *row = pixels + (y * CAM_WIDTH);
+
+    for (int x = 0; x < CAM_WIDTH / 2; x++)
+    {
+      uint16_t temp = row[x];
+      row[x] = row[CAM_WIDTH - 1 - x];
+      row[CAM_WIDTH - 1 - x] = temp;
+    }
+  }
+}
+
+// --------------------------------------------------
+// LOOP: VIDEO EN DIRECTO
+// --------------------------------------------------
+
+void loop()
+{
+  // Captura y muestra el video continuamente.
+  if (cameraCaptureFrame())
+  {
+    // Invertir horizontalmente para obtener efecto espejo.
+    mirrorFrameHorizontal();
+
+    gfx->draw16bitRGBBitmap(
+      40,
+      60,
+      (uint16_t *)cameraFrame,
+      CAM_WIDTH,
+      CAM_HEIGHT
+    );
+  }
+  else
+  {
+    Serial.println("No se pudo capturar fotograma.");
+    delay(20);
+  }
+
+  // Actualizar el sensor sin detener permanentemente la cámara.
+  if (sensorColorOK &&
+      millis() - ultimaLecturaColor >= INTERVALO_COLOR)
+  {
+    ultimaLecturaColor = millis();
+    actualizarColor();
+  }
+}
